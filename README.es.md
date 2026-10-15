@@ -26,7 +26,7 @@ Hound indexa los ficheros de la carpeta compartida y permite encontrarlos por su
 | Tipo | Extensiones | Qué se extrae |
 |---|---|---|
 | PDF | `.pdf` | Texto por página; **OCR** de las páginas escaneadas y de las que tienen la capa de texto corrupta. Los PDF largos se indexan por tramos: las primeras 30 páginas ya se pueden buscar enseguida |
-| Imágenes | `.jpg .png .tif .bmp .webp` | Texto por **OCR** (documentos fotografiados, escaneos, rótulos) y los datos **EXIF** de la foto: fecha, cámara, descripción |
+| Imágenes | `.jpg .png .tif .bmp .webp` | **Lo que muestra la foto** («la grieta del techo del baño», «la fachada con andamios»), texto por **OCR** (documentos fotografiados, escaneos, rótulos) y los datos **EXIF**: fecha, cámara, descripción |
 | AutoCAD | `.dxf`, `.dwg` | Textos, atributos de bloques (cajetines), cotas y capas. Los DWG necesitan [ODA File Converter](#ficheros-dwg-de-autocad); sin él se indexan por nombre |
 | Word | `.docx .docm .odt .rtf` | Párrafos, tablas, encabezados |
 | Excel | `.xlsx .xlsm .xls .ods .csv` | Filas por hoja, con la cabecera como contexto |
@@ -44,8 +44,9 @@ Cada resultado indica **dónde** está la coincidencia: "página 3", "hoja Gasto
 - **Windows:** Windows Server 2016 o posterior, de 64 bits.
 - **Linux:** una distribución de 64 bits (x86_64 o aarch64) con systemd: Debian/Ubuntu, RHEL/Rocky/Alma (con EPEL), Fedora, openSUSE o Arch. La carpeta compartida suele servirse con Samba.
 - Acceso a internet durante la instalación.
-- Unos 2 GB de disco para el programa y el modelo, más el índice: unos 4–5 KB por fragmento. Con 1 millón de fragmentos son unos 5 GB.
-- RAM para los vectores en memoria: unos 3 KB por fragmento. Con 1 millón son unos 3 GB, o la mitad con `memory_dtype = "float16"`.
+- Unos 2,5 GB de disco para el programa y el modelo (codificadores de texto e imagen, ~510 MB), más el índice: unos 4–5 KB por fragmento. Con 1 millón de fragmentos son unos 5 GB.
+- RAM para los vectores en memoria: unos 3 KB por fragmento. Con 1 millón son unos 3 GB, o la mitad con `memory_dtype = "float16"`. El indexador usa aproximadamente 1 GB más para los modelos.
+- Tiempo de CPU para las fotos: unos 2 segundos por imagen para «lo que muestra», además del OCR. 10 000 fotos son unas 6 horas, en segundo plano.
 - No necesita GPU.
 
 ## Instalación
@@ -137,6 +138,8 @@ Al terminar la instalación, el servidor MCP ya responde y el índice se constru
 ### Actualizar
 
 Vuelve a ejecutar el mismo comando de instalación (`install.ps1` o `install.sh`). Se conservan la configuración, el índice y los tokens.
+
+Si una actualización cambia el modelo de embeddings (como el paso a EmbeddingGemma 2), el indexador recalcula los vectores **a partir del texto que ya tiene**: no se vuelve a extraer ni a pasar OCR a ningún fichero. Mientras tanto la búsqueda por palabras clave sigue funcionando, y `index_status` / `hound status` indican cuántos ficheros faltan. Después, las imágenes ya indexadas reciben en segundo plano su vector de «lo que muestra».
 
 ### Desinstalar
 
@@ -315,9 +318,12 @@ El fichero es `C:\ProgramData\Hound\config.toml` en Windows y `/etc/hound/config
 | | `max_cpu_percent` | `0` | Va despacio también cuando otros programas usan más CPU que este valor (%). `0` = no medir |
 | `ocr` | `enabled`, `languages`, `dpi` | `true`, `spa+eng`, `300` | OCR con Tesseract |
 | `cad` | `oda_converter` | se detecta | Ruta a `ODAFileConverter.exe` |
-| `model` | `repo`, `file`, `dim` | EmbeddingGemma-300M int8, 768 | Modelo de embeddings ONNX |
+| `model` | `repo`, `file`, `dim` | EmbeddingGemma 2 int8, 768 | Modelo de embeddings ONNX |
+| | `vision_file` | codificador de imagen | Búsqueda de fotos por lo que muestran; vacío para desactivarla |
+| | `image_tokens` | `140` | Detalle por imagen: `70`, `140` o `280` (cada paso duplica el tiempo) |
 | | `threads` | la mitad de los núcleos | Hilos de CPU para los embeddings |
 | `search` | `memory_dtype` | `float32` | `float16` usa la mitad de RAM y es algo más lento |
+| | `image_min_similarity` | `0.62` | Cuánto debe parecerse una foto a la consulta para contar (0–1) |
 | `permissions` | `mode` | `ntfs` / `posix` | `ntfs` (Windows), `posix` (Linux) o `none` |
 
 Sobre HTTPS: dentro de la VPN el tráfico ya va cifrado. Si aun así quieres usar HTTPS con un certificado propio, los usuarios deben configurar `NODE_EXTRA_CA_CERTS` con la CA para que Claude Code lo acepte.
@@ -330,11 +336,12 @@ Sobre HTTPS: dentro de la VPN el tráfico ya va cifrado. Si aun así quieres usa
   - `segments_fts`: índice de palabras clave FTS5, sin tildes;
   - `security_descriptors`: deduplicados, porque casi todos los ficheros heredan los permisos de su carpeta;
   - `users`, `tokens` y `query_log`.
-- **Modelo:** [EmbeddingGemma-300M](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX), cuantizado int8, con ONNX Runtime en CPU. Es multilingüe, con buena calidad en español, y dos veces más ligero que bge-m3. Se descarga una vez y funciona sin conexión.
+- **Modelo:** [EmbeddingGemma 2](https://huggingface.co/onnx-community/embeddinggemma-2-ONNX) de Google DeepMind, cuantizado int8, con ONNX Runtime en CPU. Es multilingüe, con buena calidad en español, y pone **texto e imágenes en el mismo espacio**: una consulta de texto se compara directamente con lo que muestra una foto. Las imágenes pasan por su codificador de visión (solo lo carga el indexador). Se descarga una vez y funciona sin conexión.
 - **Búsqueda híbrida:**
-  1. Similitud coseno contra todos los vectores en memoria (numpy, por bloques).
-  2. En paralelo, FTS5 con BM25 para las palabras clave.
-  3. Las dos listas se combinan con *Reciprocal Rank Fusion* y se agrupan por fichero.
+  1. Similitud coseno contra todos los vectores de texto en memoria (numpy, por bloques).
+  2. Por separado, contra los vectores de «lo que muestra» de las fotos, quedándose solo con los que superan `image_min_similarity`. Van en su propia lista porque una consulta se parece siempre menos a una foto (≈0,7 si coincide) que a un texto (≈0,85): mezcladas, las fotos nunca llegarían arriba.
+  3. En paralelo, FTS5 con BM25 para las palabras clave.
+  4. Las listas se combinan con *Reciprocal Rank Fusion* **por fichero**: cada lista cuenta una vez por fichero, con la posición de su mejor fragmento. Una foto que coincide por nombre y por lo que muestra suma ambas listas, y un documento largo no gana solo por tener muchos fragmentos.
 
   Con 1 millón de fragmentos, la parte vectorial tarda unos 120 ms.
 - **Indexado incremental:**
@@ -349,7 +356,7 @@ Sobre HTTPS: dentro de la VPN el tráfico ya va cifrado. Si aun así quieres usa
 ## Limitaciones conocidas
 
 - `.doc` y `.ppt` antiguos (formato binario) se indexan solo por nombre.
-- Las imágenes se buscan por el texto que contienen (OCR), no por lo que muestran. La búsqueda de fotos por contenido y el audio quedan para una fase posterior.
+- Las páginas escaneadas de los PDF se buscan por su texto OCR, no por su aspecto. El audio y el vídeo se indexan solo por nombre.
 - Las etiquetas de ubicación y los mensajes del servidor están en español.
 - Las mejoras en la extracción de PDF e imágenes (tramos, texto corrupto, EXIF) se aplican a los ficheros nuevos y modificados; para aplicarlas a los que ya existen, usa `hound reindex --path` (repite su OCR).
 - Las rutas se comparan sin distinguir mayúsculas, como en Windows. En Linux, dos ficheros de la misma carpeta cuyos nombres solo se diferencian en las mayúsculas se indexan como uno.

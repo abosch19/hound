@@ -39,7 +39,10 @@ CREATE TABLE IF NOT EXISTS files (
     inode       INTEGER,                -- identificador en el disco: detecta ficheros movidos
     dev         INTEGER,
     pages_done  INTEGER NOT NULL DEFAULT 0,  -- PDF largos: páginas ya indexadas (status = partial)
-    pages_total INTEGER
+    pages_total INTEGER,
+    emb         INTEGER NOT NULL DEFAULT 0,  -- generación del modelo con el que se calcularon sus vectores
+    title       TEXT,                   -- título del documento (para recalcular vectores sin reextraer)
+    visual      INTEGER NOT NULL DEFAULT 0   -- imágenes: 1 con vector visual, -1 si no se pudo
 );
 CREATE INDEX IF NOT EXISTS files_status ON files(status);
 CREATE INDEX IF NOT EXISTS files_mtime ON files(mtime);
@@ -117,7 +120,8 @@ def connect(path: Path | str, readonly: bool = False) -> sqlite3.Connection:
 # Columnas añadidas después de la primera versión: se crean en índices existentes.
 _MIGRATIONS = {
     "files": [("inode", "INTEGER"), ("dev", "INTEGER"), ("pages_done", "INTEGER NOT NULL DEFAULT 0"),
-              ("pages_total", "INTEGER")],
+              ("pages_total", "INTEGER"), ("emb", "INTEGER NOT NULL DEFAULT 0"), ("title", "TEXT"),
+              ("visual", "INTEGER NOT NULL DEFAULT 0")],
 }
 
 

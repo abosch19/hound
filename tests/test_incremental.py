@@ -235,3 +235,75 @@ def test_pdf_movido_mientras_se_lee_sigue_despues(env):
         pass
     row = ix.conn.execute("SELECT status, pages_done, error FROM files WHERE name = 'memoria.pdf'").fetchone()
     assert tuple(row) == ("indexed", 120, None)
+
+
+# --- EmbeddingGemma 2: imágenes y cambio de modelo -------------------------------------------
+
+def _photo(path, color):
+    from PIL import Image
+
+    Image.new("RGB", (200, 150), color).save(path)
+
+
+def test_fotos_por_lo_que_se_ve(env):
+    cfg, root, ix, emb = env
+    _photo(root / "Obras" / "IMG_0001.jpg", (220, 30, 30))   # para HashEmbedder: "rojo foto imagen"
+    _photo(root / "Obras" / "IMG_0002.jpg", (30, 200, 40))   # "verde foto imagen"
+    _run(ix)
+    rows = ix.conn.execute("SELECT name, visual FROM files WHERE kind = 'image' ORDER BY name").fetchall()
+    assert [tuple(r) for r in rows] == [("IMG_0001.jpg", 1), ("IMG_0002.jpg", 1)]
+    cfg.search.image_min_similarity = 0.3
+    res = SearchIndex(cfg, emb, NoSecurity()).search(ANY, "rojo")
+    by_name = {r["name"]: r for r in res}
+    assert by_name["IMG_0001.jpg"]["location"] == "imagen (lo que se ve)"
+    assert by_name.get("IMG_0002.jpg", {}).get("location") != "imagen (lo que se ve)"
+    st = index_status(ix.conn)
+    assert st["images"] == {"with_visual_search": 2, "waiting": 0, "without": 0}
+
+
+def test_imagenes_ya_indexadas_reciben_vector_visual(env):
+    cfg, root, _ix, emb = env
+    _photo(root / "foto.jpg", (30, 30, 220))
+
+    class NoVision(HashEmbedder):
+        vision = None
+
+    old = Indexer(cfg, NoVision(256), NoSecurity())
+    _run(old)
+    assert old.conn.execute("SELECT visual FROM files WHERE name = 'foto.jpg'").fetchone()[0] == 0
+    old.close()
+    ix = Indexer(cfg, emb, NoSecurity())
+    before = ix.conn.execute("SELECT count(*) FROM segments").fetchone()[0]
+    while ix.process_pending():
+        pass
+    assert ix.conn.execute("SELECT visual, status FROM files WHERE name = 'foto.jpg'").fetchone()[:] == (1, "indexed")
+    assert ix.conn.execute("SELECT count(*) FROM segments").fetchone()[0] == before + 1  # solo el visual
+    ix.close()
+
+
+def test_cambio_de_modelo_sin_reextraer(env, monkeypatch):
+    cfg, root, ix, emb = env
+    _run(ix)
+    ix.close()
+
+    class Nuevo(HashEmbedder):
+        name = "hash-v2"
+
+    import hound.indexer as indexer_mod
+
+    calls = []
+    monkeypatch.setattr(indexer_mod, "_extract_worker", lambda *a: calls.append(a))
+    new = Indexer(cfg, Nuevo(256), NoSecurity())
+    assert new.gen == 1
+    index = SearchIndex(cfg, Nuevo(256), NoSecurity())
+    assert index.search(ANY, "presupuesto cocina")  # por palabras sigue encontrando
+    assert not index._vector_candidates(Nuevo(256).embed_query("cocina"), index.filter_mask(ANY), 10)
+    assert index_status(new.conn)["model_upgrade_files_left"] == 2
+    while new.process_pending():
+        pass
+    assert not calls  # no se ha vuelto a extraer nada
+    assert not new.conn.execute("SELECT 1 FROM files WHERE emb < 1").fetchone()
+    index.refresh()
+    assert index._vector_candidates(Nuevo(256).embed_query("cocina"), index.filter_mask(ANY), 10)
+    assert "model_upgrade_files_left" not in index_status(new.conn)
+    new.close()

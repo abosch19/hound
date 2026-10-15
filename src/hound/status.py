@@ -70,7 +70,7 @@ def index_status(conn: sqlite3.Connection, extra: dict[str, Any] | None = None) 
     # Lo que falta, con el coste aprendido de cada tipo de fichero (no supone que todo cueste igual).
     from .costs import backlog_seconds
 
-    left_s = backlog_seconds(conn) if pending or partial else 0.0
+    left_s = backlog_seconds(conn)
     eta_min = round(left_s / 60) if left_s else None
     pdf_done = conn.execute("SELECT coalesce(sum(pages_done), 0), coalesce(sum(pages_total), 0) FROM files "
                             "WHERE status = 'partial'").fetchone()
@@ -92,6 +92,15 @@ def index_status(conn: sqlite3.Connection, extra: dict[str, Any] | None = None) 
     }
     if partial:
         out["partial_pdf_pages"] = {"done": pdf_done[0], "total": pdf_done[1]}
+    gen = int(db.get_meta(conn, "model_gen", "0"))
+    reembed = conn.execute("SELECT count(*) FROM files WHERE emb < ? AND status != 'pending'", (gen,)).fetchone()[0]
+    if reembed:
+        out["model_upgrade_files_left"] = reembed
+    visual = {r[0]: r[1] for r in conn.execute(
+        "SELECT visual, count(*) FROM files WHERE kind = 'image' AND status = 'indexed' GROUP BY visual")}
+    if visual and db.get_meta(conn, "vision") == "1":
+        out["images"] = {"with_visual_search": visual.get(1, 0), "waiting": visual.get(0, 0),
+                         "without": visual.get(-1, 0)}
     if alive and phase == "scanning" and state.get("seen") is not None:
         out["scan_files_seen"] = state["seen"]
     if extra:
@@ -107,6 +116,13 @@ def format_status(st: dict[str, Any]) -> str:
     pct = f"{st['progress_percent']}%" if st["progress_percent"] is not None else "-"
     lines.append(f"Progreso: {pct} · {f['indexed']} indexados, {f['pending']} pendientes, {f['errors']} con error "
                  f"(de {f['total']})")
+    if st.get("model_upgrade_files_left"):
+        lines.append(f"  Modelo nuevo: faltan {st['model_upgrade_files_left']} ficheros por recalcular "
+                     "(sin reextraer; mientras, se encuentran por palabras)")
+    im = st.get("images")
+    if im:
+        lines.append(f"  Imágenes con búsqueda por lo que se ve: {im['with_visual_search']}"
+                     + (f", {im['waiting']} en cola" if im["waiting"] else ""))
     if f.get("partial_pdfs"):
         p = st.get("partial_pdf_pages", {})
         lines.append(f"  PDF largos a medias (ya se pueden buscar): {f['partial_pdfs']}, "

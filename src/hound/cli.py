@@ -90,6 +90,11 @@ languages = "spa+eng"
 # ruta por defecto, indica aquí el ejecutable:
 # oda_converter = '{oda_example}'
 
+[model]
+# Búsqueda de fotos por lo que se ve (EmbeddingGemma 2). Para desactivarla: vision_file = ""
+# Detalle con el que se mira cada imagen: 70, 140 o 280 (cada paso, el doble de lento).
+# image_tokens = 140
+
 [permissions]
 # "ntfs" (Windows) o "posix" (Linux): cada usuario solo ve lo que puede abrir en el disco.
 # "none": todos ven todo.
@@ -131,9 +136,16 @@ def cmd_model(args, cfg: Config) -> int:
     if args.action == "download":
         print(f"Descargando {cfg.model.repo} ({cfg.model.file}) en {cfg.models_path} …")
         download_model(cfg.model, cfg.models_path)
-    emb = load_embedder(cfg.model, cfg.models_path)
+    emb = load_embedder(cfg.model, cfg.models_path, vision=bool(cfg.model.vision_file))
     v = emb.embed_query("prueba")
     print(f"Modelo listo: {emb.name} (dimensión {len(v)})")
+    if getattr(emb, "vision", None) is not None:
+        from PIL import Image
+
+        from .embed import image_pixels
+
+        emb.embed_images([image_pixels(Image.new("RGB", (96, 96), (120, 80, 40)), cfg.model.image_tokens)])
+        print("Búsqueda por lo que se ve en las imágenes: lista")
     return 0
 
 
@@ -142,7 +154,8 @@ def _make_indexer(cfg: Config):
     from .indexer import Indexer
     from .security import get_security
 
-    return Indexer(cfg, load_embedder(cfg.model, cfg.models_path), get_security(cfg.permissions.mode, cfg.share.path))
+    return Indexer(cfg, load_embedder(cfg.model, cfg.models_path, vision=bool(cfg.model.vision_file)),
+                   get_security(cfg.permissions.mode, cfg.share.path))
 
 
 def cmd_index(args, cfg: Config) -> int:
@@ -530,6 +543,10 @@ def cmd_doctor(args, cfg: Config) -> int:
 
     md = model_dir(cfg.model, cfg.models_path)
     line((md / cfg.model.file).exists(), f"Modelo: {md / cfg.model.file}", "Ejecuta: hound model download")
+    if cfg.model.vision_file:
+        vf = md / cfg.model.vision_file
+        print(f"  {'OK  ' if vf.exists() else 'INFO'} Búsqueda de imágenes por lo que se ve: "
+              f"{'sí' if vf.exists() else 'no (ejecuta: hound model download)'}")
     tess = find_tesseract(cfg.ocr)
     line(tess is not None or not cfg.ocr.enabled, f"Tesseract (OCR): {tess or 'no encontrado'}",
          "Instálalo o desactiva [ocr] enabled")

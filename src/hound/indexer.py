@@ -38,6 +38,7 @@ log = logging.getLogger("hound.indexer")
 EMBED_BATCH_CHUNKS = 64
 PDF_FIRST_PAGES = 30   # primera pasada de un PDF largo: ya se puede buscar
 PDF_STEP_PAGES = 50    # pasadas siguientes, cuando no queda nada pendiente
+VISUAL_LOCATION = "imagen (lo que se ve)"
 
 
 @dataclass
@@ -146,7 +147,8 @@ class Indexer:
         self.conn = conn or db.init_db(cfg.db_path)
         self.excluder = Excluder(cfg)
         self.extensions = set(cfg.index.extensions)
-        self.opts = ExtractOptions(ocr=cfg.ocr, cad=cfg.cad)
+        self.vision = getattr(embedder, "vision", None) is not None
+        self.opts = ExtractOptions(ocr=cfg.ocr, cad=cfg.cad, visual=self.vision, image_tokens=cfg.model.image_tokens)
         self.caps = capabilities(self.opts)
         self._sd_ids: dict[str, int] = {r["hash"]: r["id"] for r in self.conn.execute(
             "SELECT id, hash FROM security_descriptors")}
@@ -162,8 +164,16 @@ class Indexer:
             db.set_meta(self.conn, "model", embedder.name)
             self.conn.commit()
         elif model != embedder.name:
-            raise RuntimeError(f"El índice se creó con el modelo {model!r} y la configuración usa "
-                               f"{embedder.name!r}. Ejecuta 'hound reindex --all' para rehacerlo.")
+            # Modelo nuevo: los vectores se recalculan en segundo plano a partir del texto ya extraído
+            # (sin repetir extracción ni OCR). Mientras, la búsqueda ignora los vectores antiguos.
+            gen = int(db.get_meta(self.conn, "model_gen", "0")) + 1
+            db.set_meta(self.conn, "model_gen", str(gen))
+            db.set_meta(self.conn, "model", embedder.name)
+            self.conn.commit()
+            log.warning("Modelo cambiado (%s -> %s): se recalculan los vectores sin reextraer", model, embedder.name)
+        self.gen = int(db.get_meta(self.conn, "model_gen", "0"))
+        db.set_meta(self.conn, "vision", "1" if self.vision else "0")
+        self.conn.commit()
 
     # --- permisos ---------------------------------------------------------------
 
@@ -412,12 +422,22 @@ class Indexer:
 
     def process_pending(self, max_files: int = 200, stop: threading.Event | None = None,
                         throttle: float = 0.0) -> int:
-        cols = "SELECT id, path, ext, kind, size, mtime, status, pages_done FROM files"
-        # Primero lo nuevo y lo barato (las imágenes, con OCR, al final); los PDF largos se
-        # terminan cuando ya no queda nada pendiente.
+        cols = "SELECT id, path, ext, kind, size, mtime, status, pages_done, title, '' AS job FROM files"
+        # Primero lo nuevo y lo barato (las imágenes, con OCR, al final); después, tras un cambio de
+        # modelo, recalcular vectores; luego el vector visual de las imágenes ya indexadas; y los PDF
+        # largos se terminan cuando ya no queda nada más.
         rows = self.conn.execute(
             cols + " WHERE status = 'pending' ORDER BY kind IN ('image', 'cad'), mtime DESC LIMIT ?",
             (max_files,)).fetchall()
+        if not rows:
+            rows = self.conn.execute(cols + " WHERE emb < ? AND status != 'pending' ORDER BY mtime DESC LIMIT ?",
+                                     (self.gen, max_files)).fetchall()
+            if rows:
+                return self._reembed(rows)
+        if not rows and self.vision:
+            rows = self.conn.execute(
+                cols.replace("'' AS job", "'visual' AS job") + " WHERE kind = 'image' AND visual = 0 AND "
+                "status = 'indexed' ORDER BY mtime DESC LIMIT ?", (max(1, max_files // 4),)).fetchall()
         if not rows:
             rows = self.conn.execute(cols + " WHERE status = 'partial' ORDER BY mtime DESC LIMIT ?",
                                      (max(1, max_files // 10),)).fetchall()
@@ -435,7 +455,11 @@ class Indexer:
         for item in [*results, *self._extract_many(small, stop)]:
             row, ex, err, elapsed = item
             failed = ex is None and err is not None
-            continuing = row["status"] == "partial"
+            continuing = row["status"] == "partial" or row["job"] == "visual"
+            if row["job"] == "visual" and (failed or ex is None or ex.pixels is None):
+                self.conn.execute("UPDATE files SET visual = -1 WHERE id = ?", (row["id"],))  # no reintentar
+                self.conn.commit()
+                continue
             if continuing and failed:
                 if not os.path.isfile(to_abs(row["path"], self.root)):
                     continue  # movido o borrado mientras se leía: el escaneo lo resuelve y luego se sigue
@@ -478,16 +502,27 @@ class Indexer:
         t0 = time.monotonic()
         vecs = self.embedder.embed_documents(items).astype(np.float16) if items else np.zeros((0, 1), np.float16)
         embed_s = time.monotonic() - t0
+        # Vector de "lo que se ve" de cada imagen (EmbeddingGemma 2), con su coste por fichero.
+        visual: dict[int, tuple[bytes, float]] = {}
+        for b, (_row, _chunks, _title, _err, _failed, ex, _cost) in enumerate(batch):
+            if ex is not None and ex.pixels is not None and self.vision:
+                t1 = time.monotonic()
+                try:
+                    v = self.embedder.embed_images([ex.pixels])[0].astype(np.float16).tobytes()
+                except Exception as exc:  # noqa: BLE001 — sin vector visual, el resto se indexa igual
+                    log.warning("%s: vector visual fallido: %s", _row["path"], exc)
+                    continue
+                visual[b] = (v, time.monotonic() - t1)
         i = 0
         conn = self.conn
         with conn:
-            for (row, chunks, _title, err, failed, ex, cost), keep in zip(batch, want):
+            for b, ((row, chunks, title, err, failed, ex, cost), keep) in enumerate(zip(batch, want)):
                 n_vec = sum(keep)
                 cur = conn.execute("SELECT size, mtime, status FROM files WHERE id = ?", (row["id"],)).fetchone()
                 if cur is None:  # se borró mientras se procesaba
                     i += n_vec
                     continue
-                continuing = row["status"] == "partial"
+                continuing = row["status"] == "partial" or row["job"] == "visual"
                 ord0 = 0
                 if continuing:
                     ord0 = (conn.execute("SELECT max(ord) FROM segments WHERE file_id = ?",
@@ -509,6 +544,20 @@ class Indexer:
                         (row["id"], ord0 + k, c.location, c.text, vec))
                     conn.execute("INSERT INTO segments_fts(rowid, text, name) VALUES (?, ?, ?)",
                                  (seg.lastrowid, c.text, name_text))
+                vis = visual.get(b)
+                if vis is not None:
+                    seg = conn.execute(
+                        "INSERT INTO segments(file_id, ord, location, text, vec) VALUES (?, ?, ?, '', ?)",
+                        (row["id"], ord0 + len(chunks), VISUAL_LOCATION, vis[0]))
+                    conn.execute("INSERT INTO segments_fts(rowid, text, name) VALUES (?, '', ?)",
+                                 (seg.lastrowid, name_text))
+                    cost += vis[1]
+                if row["job"] == "visual":
+                    conn.execute("UPDATE files SET visual = ?, seq = ? WHERE id = ?",
+                                 (1 if vis else -1, db.next_seq(conn), row["id"]))
+                    if vis:
+                        self.costs.add("_visual", 0.0, cost)
+                    continue
                 pages_done = ex.pages_done if ex is not None else None
                 pages_total = ex.pages_total if ex is not None else None
                 # Si cambió mientras se extraía, se deja pendiente para la próxima vuelta.
@@ -522,9 +571,11 @@ class Indexer:
                 else:
                     status = "indexed"
                 conn.execute("UPDATE files SET status = ?, error = ?, extractor = ?, indexed_at = ?, seq = ?, "
-                             "pages_done = ?, pages_total = ? WHERE id = ?",
+                             "pages_done = ?, pages_total = ?, emb = ?, title = coalesce(nullif(?, ''), title), "
+                             "visual = CASE WHEN ? THEN 1 WHEN ? THEN 0 ELSE visual END WHERE id = ?",
                              (status, err, extractor_tag(row["kind"], self.caps), time.time(),
-                              db.next_seq(conn), pages_done or 0, pages_total, row["id"]))
+                              db.next_seq(conn), pages_done or 0, pages_total, self.gen, title,
+                              vis is not None, not continuing, row["id"]))
                 if not failed and still_same:
                     mb = row["size"] / 1e6
                     if pages_total and pages_done is not None:
@@ -537,7 +588,56 @@ class Indexer:
             set_state(conn, "indexing")  # latido: un lote con OCR puede tardar mucho
         return len(batch)
 
+    def _reembed(self, rows: list[sqlite3.Row]) -> int:
+        """Tras cambiar de modelo: vectores nuevos a partir del texto guardado, sin reextraer.
+
+        Se escriben como fragmentos nuevos y se retiran los antiguos, igual que al reindexar un
+        fichero, para que los lectores con los vectores en memoria se actualicen solos. Los vectores
+        visuales no salen del texto: esas imágenes vuelven a la cola del vector visual."""
+        conn = self.conn
+        work = []
+        for row in rows:
+            segs = conn.execute("SELECT id, ord, location, text, length(vec) > 0 AS has_vec FROM segments "
+                                "WHERE file_id = ? ORDER BY ord", (row["id"],)).fetchall()
+            work.append((row, [s for s in segs if s["text"]]))
+        items, owners = [], []
+        for k, (row, segs) in enumerate(work):
+            name = row["path"].rpartition("/")[2]
+            for s in segs:
+                if s["has_vec"]:
+                    items.append((row["title"] or name, s["text"]))
+                    owners.append((k, s["id"]))
+        t0 = time.monotonic()
+        vecs = self.embedder.embed_documents(items).astype(np.float16) if items else None
+        per_vec = (time.monotonic() - t0) / max(1, len(items))
+        new_vec = {sid: vecs[i].tobytes() for i, (_k, sid) in enumerate(owners)}
+        with conn:
+            for row, segs in work:
+                cur = conn.execute("SELECT max(id) FROM segments WHERE file_id = ?", (row["id"],)).fetchone()[0]
+                if cur is not None:
+                    conn.execute("DELETE FROM segments_fts WHERE rowid IN (SELECT id FROM segments WHERE file_id = ?)",
+                                 (row["id"],))
+                    conn.execute("DELETE FROM segments WHERE file_id = ?", (row["id"],))
+                    conn.execute("INSERT INTO tombstones(file_id, upto_seg, ts) VALUES (?, ?, ?)",
+                                 (row["id"], cur, time.time()))
+                name_text = row["path"].replace("/", " ")
+                for s in segs:
+                    seg = conn.execute("INSERT INTO segments(file_id, ord, location, text, vec) VALUES (?, ?, ?, ?, ?)",
+                                       (row["id"], s["ord"], s["location"], s["text"], new_vec.get(s["id"], b"")))
+                    conn.execute("INSERT INTO segments_fts(rowid, text, name) VALUES (?, ?, ?)",
+                                 (seg.lastrowid, s["text"], name_text))
+                conn.execute("UPDATE files SET emb = ?, visual = 0, seq = ? WHERE id = ?",
+                             (self.gen, db.next_seq(conn), row["id"]))
+                n = sum(1 for s in segs if s["has_vec"])
+                if n:
+                    self.costs.add("_reembed", n / 100, n * per_vec)
+            self.costs.save(conn)
+            set_state(conn, "indexing")
+        return len(rows)
+
     def _opts_for(self, row: sqlite3.Row) -> ExtractOptions:
+        if row["job"] == "visual":
+            return replace(self.opts, visual_only=True)
         if row["kind"] != "pdf":
             return self.opts
         if row["status"] == "partial":
@@ -684,7 +784,11 @@ class Indexer:
                     stop.wait(60)  # carga inicial: se espera a que acabe la jornada
                     continue
                 throttle = self.cfg.index.schedule.busy_pause_ms / 1000 if mode in ("slow", "pause") else 0.0
-                set_state(self.conn, "indexing" if backlog else "idle")
+                extra = backlog or self.conn.execute(
+                    "SELECT 1 FROM files WHERE (emb < ? AND status != 'pending') OR (? AND kind = 'image' "
+                    "AND visual = 0 AND status = 'indexed') OR status = 'partial' LIMIT 1",
+                    (self.gen, self.vision)).fetchone()
+                set_state(self.conn, "indexing" if extra else "idle")
                 self.conn.commit()
                 n = self.process_pending(max_files=50 if busy else 200, stop=stop, throttle=throttle)
                 if n == 0:

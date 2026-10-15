@@ -107,8 +107,12 @@ class CadConfig:
 
 @dataclass
 class ModelConfig:
-    repo: str = "onnx-community/embeddinggemma-300m-ONNX"
+    repo: str = "onnx-community/embeddinggemma-2-ONNX"
     file: str = "onnx/model_quantized.onnx"
+    vision_file: str = "onnx/vision_encoder_quantized.onnx"
+    """Codificador de imágenes (EmbeddingGemma 2): busca fotos por lo que se ve. Vacío = sin él."""
+    image_tokens: int = 140
+    """Detalle con el que se mira cada imagen: 70, 140 o 280 (el doble de lento cada paso)."""
     dim: int = 768
     max_tokens: int = 512
     query_prefix: str = "task: search result | query: "
@@ -124,6 +128,8 @@ class SearchConfig:
     candidates: int = 300
     chunk_chars: int = 1400
     chunk_overlap: int = 200
+    image_min_similarity: float = 0.62
+    """Parecido mínimo entre la consulta y lo que se ve en una foto para que cuente (0–1)."""
 
 
 @dataclass

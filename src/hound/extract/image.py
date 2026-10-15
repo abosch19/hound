@@ -8,6 +8,7 @@ from .ocr import find_tesseract, ocr_image
 
 MAX_SIDE = 5000
 MAX_FRAMES = 50
+MIN_VISUAL_PX = 64  # iconos y miniaturas no merecen vector visual
 
 
 MONTHS = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre",
@@ -56,6 +57,12 @@ def extract_image(path: str, opts: ExtractOptions) -> Extracted:
     except Exception as exc:  # noqa: BLE001
         raise ExtractionError(f"Imagen ilegible: {exc}") from exc
     with img:
+        if opts.visual and min(img.size) >= MIN_VISUAL_PX:
+            from ..embed import image_pixels
+
+            out.pixels = image_pixels(ImageOps.exif_transpose(img), opts.image_tokens)
+        if opts.visual_only:
+            return out
         meta = exif_text(img)
         if meta:
             out.blocks.append(Block(meta, group="datos de la foto"))

@@ -26,7 +26,7 @@ Hound indexa els fitxers de la carpeta compartida i permet trobar-los pel seu si
 | Tipus | Extensions | Què se n'extreu |
 |---|---|---|
 | PDF | `.pdf` | Text per pàgina; **OCR** de les pàgines escanejades i de les que tenen la capa de text corrupta. Els PDF llargs s'indexen per trams: les primeres 30 pàgines ja es poden cercar de seguida |
-| Imatges | `.jpg .png .tif .bmp .webp` | Text per **OCR** (documents fotografiats, escanejos, rètols) i les dades **EXIF** de la foto: data, càmera, descripció |
+| Imatges | `.jpg .png .tif .bmp .webp` | **El que mostra la foto** («l'esquerda del sostre del bany», «la façana amb bastides»), text per **OCR** (documents fotografiats, escanejos, rètols) i les dades **EXIF**: data, càmera, descripció |
 | AutoCAD | `.dxf`, `.dwg` | Textos, atributs de blocs (caixetins), cotes i capes. Els DWG necessiten [ODA File Converter](#fitxers-dwg-dautocad); sense ell s'indexen pel nom |
 | Word | `.docx .docm .odt .rtf` | Paràgrafs, taules, capçaleres |
 | Excel | `.xlsx .xlsm .xls .ods .csv` | Files per full, amb la capçalera com a context |
@@ -44,8 +44,9 @@ Cada resultat indica **on** és la coincidència: "página 3", "hoja Gastos, fil
 - **Windows:** Windows Server 2016 o posterior, de 64 bits.
 - **Linux:** una distribució de 64 bits (x86_64 o aarch64) amb systemd: Debian/Ubuntu, RHEL/Rocky/Alma (amb EPEL), Fedora, openSUSE o Arch. La carpeta compartida sol servir-se amb Samba.
 - Accés a internet durant la instal·lació.
-- Uns 2 GB de disc per al programa i el model, més l'índex: uns 4–5 KB per fragment. Amb 1 milió de fragments són uns 5 GB.
-- RAM per als vectors en memòria: uns 3 KB per fragment. Amb 1 milió són uns 3 GB, o la meitat amb `memory_dtype = "float16"`.
+- Uns 2,5 GB de disc per al programa i el model (codificadors de text i imatge, ~510 MB), més l'índex: uns 4–5 KB per fragment. Amb 1 milió de fragments són uns 5 GB.
+- RAM per als vectors en memòria: uns 3 KB per fragment. Amb 1 milió són uns 3 GB, o la meitat amb `memory_dtype = "float16"`. L'indexador fa servir aproximadament 1 GB més per als models.
+- Temps de CPU per a les fotos: uns 2 segons per imatge per a «el que mostra», a més de l'OCR. 10 000 fotos són unes 6 hores, en segon pla.
 - No necessita GPU.
 
 ## Instal·lació
@@ -137,6 +138,8 @@ En acabar la instal·lació, el servidor MCP ja respon i l'índex es construeix 
 ### Actualitzar
 
 Torna a executar la mateixa ordre d'instal·lació (`install.ps1` o `install.sh`). Es conserven la configuració, l'índex i els tokens.
+
+Si una actualització canvia el model d'embeddings (com el pas a EmbeddingGemma 2), l'indexador recalcula els vectors **a partir del text que ja té**: no es torna a extreure ni a passar OCR a cap fitxer. Mentrestant la cerca per paraules clau continua funcionant, i `index_status` / `hound status` indiquen quants fitxers falten. Després, les imatges ja indexades reben en segon pla el seu vector de «el que mostra».
 
 ### Desinstal·lar
 
@@ -315,9 +318,12 @@ El fitxer és `C:\ProgramData\Hound\config.toml` a Windows i `/etc/hound/config.
 | | `max_cpu_percent` | `0` | Va a poc a poc també quan altres programes fan servir més CPU que aquest valor (%). `0` = no mesurar |
 | `ocr` | `enabled`, `languages`, `dpi` | `true`, `spa+eng`, `300` | OCR amb Tesseract |
 | `cad` | `oda_converter` | es detecta | Ruta a `ODAFileConverter.exe` |
-| `model` | `repo`, `file`, `dim` | EmbeddingGemma-300M int8, 768 | Model d'embeddings ONNX |
+| `model` | `repo`, `file`, `dim` | EmbeddingGemma 2 int8, 768 | Model d'embeddings ONNX |
+| | `vision_file` | codificador d'imatge | Cerca de fotos pel que mostren; buit per desactivar-la |
+| | `image_tokens` | `140` | Detall per imatge: `70`, `140` o `280` (cada pas duplica el temps) |
 | | `threads` | la meitat dels nuclis | Fils de CPU per als embeddings |
 | `search` | `memory_dtype` | `float32` | `float16` fa servir la meitat de RAM i és una mica més lent |
+| | `image_min_similarity` | `0.62` | Quant s'ha de semblar una foto a la consulta per comptar (0–1) |
 | `permissions` | `mode` | `ntfs` / `posix` | `ntfs` (Windows), `posix` (Linux) o `none` |
 
 Sobre HTTPS: dins de la VPN el trànsit ja va xifrat. Si tot i així vols fer servir HTTPS amb un certificat propi, els usuaris han de configurar `NODE_EXTRA_CA_CERTS` amb la CA perquè Claude Code l'accepti.
@@ -330,11 +336,12 @@ Sobre HTTPS: dins de la VPN el trànsit ja va xifrat. Si tot i així vols fer se
   - `segments_fts`: índex de paraules clau FTS5, sense accents;
   - `security_descriptors`: deduplicats, perquè gairebé tots els fitxers hereten els permisos de la seva carpeta;
   - `users`, `tokens` i `query_log`.
-- **Model:** [EmbeddingGemma-300M](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX), quantitzat int8, amb ONNX Runtime a la CPU. És multilingüe, amb bona qualitat en castellà, i la meitat de pesant que bge-m3. Es descarrega una vegada i després funciona sense connexió.
+- **Model:** [EmbeddingGemma 2](https://huggingface.co/onnx-community/embeddinggemma-2-ONNX) de Google DeepMind, quantitzat int8, amb ONNX Runtime a la CPU. És multilingüe, amb bona qualitat en castellà, i posa **text i imatges al mateix espai**: una consulta de text es compara directament amb el que mostra una foto. Les imatges passen pel seu codificador de visió (només el carrega l'indexador). Es descarrega una vegada i després funciona sense connexió.
 - **Cerca híbrida:**
-  1. Similitud cosinus contra tots els vectors en memòria (numpy, per blocs).
-  2. En paral·lel, FTS5 amb BM25 per a les paraules clau.
-  3. Les dues llistes es combinen amb *Reciprocal Rank Fusion* i s'agrupen per fitxer.
+  1. Similitud cosinus contra tots els vectors de text en memòria (numpy, per blocs).
+  2. Per separat, contra els vectors de «el que mostra» de les fotos, quedant-se només amb els que superen `image_min_similarity`. Van en la seva pròpia llista perquè una consulta s'assembla sempre menys a una foto (≈0,7 si coincideix) que a un text (≈0,85): barrejades, les fotos mai arribarien amunt.
+  3. En paral·lel, FTS5 amb BM25 per a les paraules clau.
+  4. Les llistes es combinen amb *Reciprocal Rank Fusion* **per fitxer**: cada llista compta una vegada per fitxer, amb la posició del seu millor fragment. Una foto que coincideix pel nom i pel que mostra suma les dues llistes, i un document llarg no guanya només per tenir molts fragments.
 
   Amb 1 milió de fragments, la part vectorial triga uns 120 ms.
 - **Indexació incremental:**
@@ -349,7 +356,7 @@ Sobre HTTPS: dins de la VPN el trànsit ja va xifrat. Si tot i així vols fer se
 ## Limitacions conegudes
 
 - Els `.doc` i `.ppt` antics (format binari) s'indexen només pel nom.
-- Les imatges es cerquen pel text que contenen (OCR), no pel que mostren. La cerca de fotos pel contingut i l'àudio queden per a una fase posterior.
+- Les pàgines escanejades dels PDF es cerquen pel seu text OCR, no per l'aspecte. L'àudio i el vídeo s'indexen només pel nom.
 - Les etiquetes d'ubicació i els missatges del servidor són en castellà.
 - Les millores en l'extracció de PDF i imatges (trams, text corrupte, EXIF) s'apliquen als fitxers nous i modificats; per aplicar-les als que ja existeixen, fes servir `hound reindex --path` (repeteix el seu OCR).
 - Les rutes es comparen sense distingir majúscules, com a Windows. A Linux, dos fitxers de la mateixa carpeta els noms dels quals només es diferencien en les majúscules s'indexen com un de sol.

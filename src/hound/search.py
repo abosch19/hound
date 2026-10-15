@@ -61,13 +61,15 @@ class User:
 
 
 class _VecBlock:
-    __slots__ = ("vecs", "seg_ids", "file_idx", "alive")
+    __slots__ = ("vecs", "seg_ids", "file_idx", "alive", "visual")
 
-    def __init__(self, vecs: np.ndarray, seg_ids: np.ndarray, file_idx: np.ndarray):
+    def __init__(self, vecs: np.ndarray, seg_ids: np.ndarray, file_idx: np.ndarray,
+                 visual: np.ndarray | None = None):
         self.vecs = vecs
         self.seg_ids = seg_ids
         self.file_idx = file_idx
         self.alive = np.ones(len(seg_ids), dtype=bool)
+        self.visual = visual if visual is not None else np.zeros(len(seg_ids), dtype=bool)
 
 
 class _FileTable:
@@ -81,18 +83,19 @@ class _FileTable:
         self.sd = np.full(cap, -1, dtype=np.int64)
         self.mtime = np.zeros(cap, dtype=np.float64)
         self.kind = np.zeros(cap, dtype=np.int8)
+        self.emb = np.zeros(cap, dtype=np.int32)
         self.alive = np.zeros(cap, dtype=bool)
         self.paths: list[str] = []
 
     def _grow(self):
         cap = len(self.ids) * 2
-        for name in ("ids", "sd", "mtime", "kind", "alive"):
+        for name in ("ids", "sd", "mtime", "kind", "alive", "emb"):
             old = getattr(self, name)
             new = np.zeros(cap, dtype=old.dtype) if name != "sd" else np.full(cap, -1, dtype=old.dtype)
             new[: len(old)] = old
             setattr(self, name, new)
 
-    def upsert(self, fid: int, path: str, sd: int | None, mtime: float, kind: str) -> int:
+    def upsert(self, fid: int, path: str, sd: int | None, mtime: float, kind: str, emb: int = 0) -> int:
         i = self.idx.get(fid)
         if i is None:
             if self.n == len(self.ids):
@@ -107,6 +110,7 @@ class _FileTable:
         self.sd[i] = -1 if sd is None else sd
         self.mtime[i] = mtime
         self.kind[i] = KIND_CODES.get(kind, 0)
+        self.emb[i] = emb
         self.alive[i] = True
         return i
 
@@ -241,15 +245,16 @@ class SearchIndex:
             model = db.get_meta(c, "model")
             self.model_ok = model is None or model == self.embedder.name
             if not self.model_ok:
-                log.error("El índice se creó con el modelo %s y la configuración usa %s: ejecuta "
-                          "'hound reindex --all'", model, self.embedder.name)
+                log.warning("El índice usa el modelo %s y la configuración %s: el indexador lo cambiará al "
+                            "arrancar (recalcula los vectores sin reextraer)", model, self.embedder.name)
                 return
             if seq == self.last_seq:
                 return
             t0 = time.monotonic()
             changed_files = 0
-            for r in c.execute("SELECT id, path, sd_id, mtime, kind FROM files WHERE seq > ?", (self.last_seq,)):
-                self.files.upsert(r["id"], r["path"], r["sd_id"], r["mtime"], r["kind"])
+            self.gen = int(db.get_meta(c, "model_gen", "0"))
+            for r in c.execute("SELECT id, path, sd_id, mtime, kind, emb FROM files WHERE seq > ?", (self.last_seq,)):
+                self.files.upsert(r["id"], r["path"], r["sd_id"], r["mtime"], r["kind"], r["emb"])
                 changed_files += 1
             # retirados: fragmentos de ficheros reindexados o borrados
             tombs: dict[int, int] = {}
@@ -267,7 +272,8 @@ class SearchIndex:
                         self.files.remove(fid)
             # fragmentos nuevos
             new = 0
-            rows = c.execute("SELECT id, file_id, vec FROM segments WHERE id > ? ORDER BY id", (self.last_seg,))
+            rows = c.execute("SELECT id, file_id, vec, text = '' FROM segments WHERE id > ? ORDER BY id",
+                             (self.last_seg,))
             while True:
                 part = rows.fetchmany(BLOCK_ROWS)
                 if not part:
@@ -279,7 +285,8 @@ class SearchIndex:
                 ids = np.fromiter((r[0] for r in part), dtype=np.int64, count=len(part))
                 fidx = np.fromiter((self.files.idx.get(r[1], -1) for r in part), dtype=np.int64, count=len(part))
                 vecs = np.frombuffer(b"".join(r[2] for r in part), dtype=np.float16).reshape(len(part), -1)
-                block = _VecBlock(vecs.astype(self.dtype), ids, fidx)
+                visual = np.fromiter((bool(r[3]) for r in part), dtype=bool, count=len(part))
+                block = _VecBlock(vecs.astype(self.dtype), ids, fidx, visual)
                 block.alive &= fidx >= 0
                 self.blocks.append(block)
                 new += len(part)
@@ -410,13 +417,20 @@ class SearchIndex:
 
     # --- búsqueda -------------------------------------------------------------------
 
-    def _vector_candidates(self, qv: np.ndarray, fmask: np.ndarray, k: int) -> list[tuple[int, float]]:
+    def _vector_candidates(self, qv: np.ndarray, fmask: np.ndarray, k: int,
+                           visual: bool = False) -> list[tuple[int, float]]:
+        """Los k fragmentos más parecidos. visual=True: solo vectores de imágenes; False: solo de texto.
+
+        Van por separado porque una consulta se parece menos a una foto (≈0,7 cuando encaja) que a un
+        texto (≈0,85): juntos, las fotos nunca llegarían arriba."""
         q = qv.astype(np.float32)
         best_ids: list[np.ndarray] = []
         best_scores: list[np.ndarray] = []
+        # Tras un cambio de modelo, los vectores aún no recalculados están en otro espacio: fuera.
+        fmask = fmask & (self.files.emb[:len(fmask)] == getattr(self, "gen", 0))
         for b in list(self.blocks):
             fi = b.file_idx
-            ok = b.alive & (fi >= 0)
+            ok = b.alive & (fi >= 0) & (b.visual == visual)
             ok[ok] = fmask[fi[ok]]
             if not ok.any():
                 continue
@@ -460,13 +474,17 @@ class SearchIndex:
             raise ValueError("La consulta está vacía")
         limit = max(1, min(int(limit or 10), 50))
         if not getattr(self, "model_ok", True):
-            raise ValueError("El índice se creó con otro modelo de embeddings. "
-                             "Un administrador debe ejecutar 'hound reindex --all' en el servidor.")
+            raise ValueError("El índice está cambiando de modelo de búsqueda. Inténtalo en un minuto; si "
+                             "sigue igual, un administrador debe revisar 'hound status' en el servidor.")
         fmask = self.filter_mask(user, folder, file_type, date_from, date_to)
         if not fmask.any():
             return []
         k = self.cfg.search.candidates
-        vec = self._vector_candidates(self.embedder.embed_query(query), fmask, k)
+        qv = self.embedder.embed_query(query)
+        vec = self._vector_candidates(qv, fmask, k)
+        min_sim = self.cfg.search.image_min_similarity
+        vis = [(sid, s) for sid, s in self._vector_candidates(qv, fmask, max(10, k // 10), visual=True)
+               if s >= min_sim]
         fts = self._fts_candidates(query, fmask, k)
         rrf_k = self.cfg.search.rrf_k
         w_vec, w_fts = lookup_weights(query)
@@ -477,6 +495,9 @@ class SearchIndex:
             sim[sid] = s
         for rank, sid in enumerate(fts):
             fused[sid] = fused.get(sid, 0.0) + w_fts / (rrf_k + rank + 1)
+        for rank, (sid, s) in enumerate(vis):
+            fused[sid] = fused.get(sid, 0.0) + w_vec / (rrf_k + rank + 1)
+            sim[sid] = s
         if not fused:
             return []
         ranked = sorted(fused.items(), key=lambda x: -x[1])
@@ -489,9 +510,23 @@ class SearchIndex:
             for r in c.execute(f"SELECT id, file_id, location, text, ord FROM segments WHERE id IN "
                                f"({','.join('?' * len(part))})", part):
                 seg_rows[r["id"]] = r
-        results: dict[int, dict] = {}
-        terms = query_terms(query)
-        max_score = 2.0 / (rrf_k + 1)
+        # Fusión por fichero: cada lista (vectores de texto, palabras, lo que se ve) cuenta una vez por
+        # fichero, con el puesto de su mejor fragmento. Una foto que encaja por el nombre y por lo que
+        # se ve suma las dos listas; un documento largo no gana solo por tener muchos fragmentos.
+        def file_order(sids):
+            seen: dict[int, int] = {}
+            for sid in sids:
+                r = seg_rows.get(sid)
+                if r is not None and r["file_id"] not in seen:
+                    seen[r["file_id"]] = len(seen)
+            return seen
+
+        file_fused: dict[int, float] = {}
+        for order, w in ((file_order(s for s, _ in vec), w_vec), (file_order(fts), w_fts),
+                         (file_order(s for s, _ in vis), w_vec)):
+            for fid, rank in order.items():
+                file_fused[fid] = file_fused.get(fid, 0.0) + w / (rrf_k + rank + 1)
+        per_file: dict[int, list[tuple[float, int]]] = {}
         for sid, score in ranked:
             r = seg_rows.get(sid)
             if r is None:
@@ -499,23 +534,33 @@ class SearchIndex:
             fi = self.files.idx.get(r["file_id"])
             if fi is None or not fmask[fi]:  # doble comprobación
                 continue
-            res = results.get(r["file_id"])
-            if res is not None:
-                res["matches"] += 1
-                continue
-            if len(results) >= limit:
-                continue
+            per_file.setdefault(r["file_id"], []).append((score, sid))
+        file_scores = sorted(((file_fused.get(fid, 0.0), fid) for fid in per_file), reverse=True)[:limit]
+        results: dict[int, dict] = {}
+        terms = query_terms(query)
+        max_score = 2.0 / (rrf_k + 1)
+        for score, fid in file_scores:
+            segs = per_file[fid]
+            best = seg_rows[segs[0][1]]
+            seen = [seg_rows[sid] for _s, sid in segs if seg_rows[sid]["text"] == ""]
+            if seen:  # una foto que encaja por lo que se ve: eso es lo que hay que enseñar
+                best = seen[0]
+            elif best["ord"] == 0:  # el nombre: mejor enseñar dónde coincide el contenido, si coincide
+                inner = [seg_rows[sid] for _s, sid in segs[1:] if seg_rows[sid]["ord"] > 0]
+                if inner:
+                    best = inner[0]
+            fi = self.files.idx[fid]
             rel = self.files.paths[fi]
-            results[r["file_id"]] = {
+            results[fid] = {
                 "path": display_path(rel, self.cfg),
                 "name": rel.rpartition("/")[2],
                 "type": next((k for k, v in KIND_CODES.items() if v == self.files.kind[fi]), "other"),
-                "location": r["location"],
-                "excerpt": excerpt(r["text"], terms),
+                "location": best["location"],
+                "excerpt": excerpt(best["text"], terms),
                 "modified": _fmt_date(self.files.mtime[fi]),
                 "score": round(min(1.0, score / max_score), 3),
-                "similarity": round(sim[sid], 3) if sid in sim else None,
-                "matches": 1,
+                "similarity": round(sim[best["id"]], 3) if best["id"] in sim else None,
+                "matches": len(segs),
                 **links(rel, self.cfg),
             }
         return list(results.values())
@@ -536,11 +581,11 @@ class SearchIndex:
                       max_chars: int = 30000) -> dict:
         fid, fi, rel = self._check_file(user, path)
         c = self.conn()
-        total = c.execute("SELECT count(*) FROM segments WHERE file_id = ? AND ord > 0", (fid,)).fetchone()[0]
+        total = c.execute("SELECT count(*) FROM segments WHERE file_id = ? AND ord > 0 AND text != ''", (fid,)).fetchone()[0]
         start = max(0, int(start or 0))
         end = total if end is None else max(start, min(int(end), total))
         parts, used, last = [], 0, start
-        for r in c.execute("SELECT ord, location, text FROM segments WHERE file_id = ? AND ord > 0 ORDER BY ord "
+        for r in c.execute("SELECT ord, location, text FROM segments WHERE file_id = ? AND ord > 0 AND text != '' ORDER BY ord "
                            "LIMIT ? OFFSET ?", (fid, end - start, start)):
             if parts and used + len(r["text"]) > max_chars:
                 break

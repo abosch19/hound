@@ -1,7 +1,7 @@
 [project]
 name = "hound"
-version = "0.1.0"
-description = "Buscador semántico para carpetas compartidas de Windows Server, consultable por MCP"
+version = "0.2.0"
+description = "Buscador semántico (texto y fotos) para carpetas compartidas de Windows Server y Linux, consultable por MCP"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"

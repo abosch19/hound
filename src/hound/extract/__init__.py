@@ -32,6 +32,8 @@ class Extracted:
     blocks: list[Block] = field(default_factory=list)
     title: str = ""
     notes: list[str] = field(default_factory=list)
+    pixels: object | None = None
+    """Imagen preparada para el codificador visual (embed.ImagePixels), si se pidió."""
     pages_total: int | None = None
     pages_done: int | None = None
     """PDF por tramos: páginas leídas hasta ahora (si es menor que pages_total, queda por leer)."""
@@ -42,6 +44,11 @@ class ExtractOptions:
     ocr: OcrConfig = field(default_factory=OcrConfig)
     cad: CadConfig = field(default_factory=CadConfig)
     attachments: bool = True
+    visual: bool = False
+    """Preparar las imágenes para su vector de "lo que se ve" (EmbeddingGemma 2)."""
+    visual_only: bool = False
+    """Solo eso: sin OCR ni EXIF (imágenes ya indexadas a las que les falta el vector visual)."""
+    image_tokens: int = 140
     page_start: int = 0
     """PDF: primera página a leer (0 = desde el principio)."""
     page_limit: int = 0

@@ -26,7 +26,7 @@ Hound indexes the files in the shared folder so you can find them by meaning ("t
 | Type | Extensions | What is extracted |
 |---|---|---|
 | PDF | `.pdf` | Text per page; **OCR** of scanned pages and of pages whose text layer is garbled. Long PDFs are indexed in steps: the first 30 pages are searchable right away |
-| Images | `.jpg .png .tif .bmp .webp` | Text via **OCR** (photographed documents, scans, signs), and the photo's **EXIF** data: date taken, camera, description |
+| Images | `.jpg .png .tif .bmp .webp` | **What the photo shows** ("the crack in the bathroom ceiling", "the façade with scaffolding"), text via **OCR** (photographed documents, scans, signs) and the **EXIF** data: date taken, camera, description |
 | AutoCAD | `.dxf`, `.dwg` | Text, block attributes (title blocks), dimensions and layers. DWG files need [ODA File Converter](#autocad-dwg-files); without it they are indexed by name |
 | Word | `.docx .docm .odt .rtf` | Paragraphs, tables, headers |
 | Excel | `.xlsx .xlsm .xls .ods .csv` | Rows per sheet, with the header row as context |
@@ -44,8 +44,9 @@ Each result says **where** the match is: "página 3" (page 3), "hoja Gastos, fil
 - **Windows:** Windows Server 2016 or later, 64-bit.
 - **Linux:** a 64-bit (x86_64 or aarch64) distribution with systemd: Debian/Ubuntu, RHEL/Rocky/Alma (with EPEL), Fedora, openSUSE or Arch. The shared folder is usually served with Samba.
 - Internet access during installation.
-- About 2 GB of disk for the program and the model, plus the index: about 4–5 KB per fragment. With 1 million fragments that's about 5 GB.
-- RAM for the in-memory vectors: about 3 KB per fragment. With 1 million that's about 3 GB, or half with `memory_dtype = "float16"`.
+- About 2.5 GB of disk for the program and the model (text and image encoders, ~510 MB), plus the index: about 4–5 KB per fragment. With 1 million fragments that's about 5 GB.
+- RAM for the in-memory vectors: about 3 KB per fragment. With 1 million that's about 3 GB, or half with `memory_dtype = "float16"`. The indexer uses about 1 GB more for the models.
+- CPU time for photos: about 2 seconds per image for "what it shows", on top of OCR. 10,000 photos are about 6 hours, done in the background.
 - No GPU needed.
 
 ## Installation
@@ -137,6 +138,8 @@ When installation finishes, the MCP server is already answering and the index bu
 ### Updating
 
 Run the same installation command again (`install.ps1` or `install.sh`). Configuration, index and tokens are kept.
+
+If an update changes the embedding model (as the switch to EmbeddingGemma 2 does), the indexer recalculates the vectors **from the text it already has**: no file is extracted or OCR'd again. Meanwhile keyword search keeps working, and `index_status` / `hound status` show how many files are left. Then, images already indexed get their "what it shows" vector in the background.
 
 ### Uninstalling
 
@@ -315,9 +318,12 @@ The file is `C:\ProgramData\Hound\config.toml` on Windows and `/etc/hound/config
 | | `max_cpu_percent` | `0` | Also go slowly when other programs use more CPU than this (%). `0` = don't measure |
 | `ocr` | `enabled`, `languages`, `dpi` | `true`, `spa+eng`, `300` | OCR with Tesseract |
 | `cad` | `oda_converter` | detected | Path to `ODAFileConverter.exe` |
-| `model` | `repo`, `file`, `dim` | EmbeddingGemma-300M int8, 768 | ONNX embedding model |
+| `model` | `repo`, `file`, `dim` | EmbeddingGemma 2 int8, 768 | ONNX embedding model |
+| | `vision_file` | image encoder | Searching photos by what they show; empty to disable |
+| | `image_tokens` | `140` | Detail per image: `70`, `140` or `280` (each step doubles the time) |
 | | `threads` | half the cores | CPU threads for embeddings |
 | `search` | `memory_dtype` | `float32` | `float16` uses half the RAM and is somewhat slower |
+| | `image_min_similarity` | `0.62` | How similar a photo must look to the query to count (0–1) |
 | `permissions` | `mode` | `ntfs` / `posix` | `ntfs` (Windows), `posix` (Linux) or `none` |
 
 About HTTPS: inside the VPN traffic is already encrypted. If you still want HTTPS with your own certificate, users must set `NODE_EXTRA_CA_CERTS` to the CA so Claude Code accepts it.
@@ -330,11 +336,12 @@ About HTTPS: inside the VPN traffic is already encrypted. If you still want HTTP
   - `segments_fts`: FTS5 keyword index, accent-insensitive;
   - `security_descriptors`: deduplicated, because most files inherit their folder's permissions;
   - `users`, `tokens` and `query_log`.
-- **Model:** [EmbeddingGemma-300M](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX), int8-quantized, with ONNX Runtime on the CPU. It's multilingual, with good quality in Spanish, and half the size of bge-m3. It's downloaded once and then works offline.
+- **Model:** [EmbeddingGemma 2](https://huggingface.co/onnx-community/embeddinggemma-2-ONNX) from Google DeepMind, int8-quantized, with ONNX Runtime on the CPU. It's multilingual, with good quality in Spanish, and puts **text and images in the same space**: a text query is compared directly with what a photo shows. Images go through its vision encoder (only the indexer loads it). It's downloaded once and then works offline.
 - **Hybrid search:**
-  1. Cosine similarity against all vectors in memory (numpy, in blocks).
-  2. In parallel, FTS5 with BM25 for keywords.
-  3. Both lists are combined with *Reciprocal Rank Fusion* and grouped by file.
+  1. Cosine similarity against all text vectors in memory (numpy, in blocks).
+  2. Separately, against the photos' "what it shows" vectors, keeping only those above `image_min_similarity`. They go in their own list because a query is always less similar to a photo (≈0.7 when it matches) than to a text (≈0.85): mixed together, photos would never reach the top.
+  3. In parallel, FTS5 with BM25 for keywords.
+  4. The lists are combined with *Reciprocal Rank Fusion* **per file**: each list counts once per file, with the rank of its best fragment. A photo that matches by name and by what it shows adds both lists, and a long document doesn't win just by having many fragments.
 
   With 1 million fragments, the vector part takes about 120 ms.
 - **Incremental indexing:**
@@ -349,7 +356,7 @@ About HTTPS: inside the VPN traffic is already encrypted. If you still want HTTP
 ## Known limitations
 
 - Old `.doc` and `.ppt` files (binary format) are indexed by name only.
-- Images are searched by the text they contain (OCR), not by what they show. Photo search by content and audio are planned for a later phase.
+- Scanned PDF pages are searched by their OCR text, not by how they look. Audio and video are indexed by name only.
 - Location labels and server messages are in Spanish.
 - Improvements to PDF and image extraction (steps, garbled text, EXIF) apply to new and changed files; to apply them to existing ones, use `hound reindex --path` (it repeats their OCR).
 - Paths are compared case-insensitively, as on Windows. On Linux, two files in the same folder whose names differ only in case are indexed as one.

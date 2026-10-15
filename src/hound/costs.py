@@ -23,6 +23,8 @@ MIN_SAMPLES = 8
 DEFAULTS = {
     "text": (0.05, 0.5), "word": (0.3, 1.0), "excel": (0.4, 2.0), "powerpoint": (0.4, 1.0),
     "email": (0.3, 1.0), "pdf": (1.0, 4.0), "image": (4.0, 1.0), "cad": (0.5, 2.0), "other": (0.02, 0.0),
+    "_reembed": (0.0, 3.0),  # por cada 100 fragmentos
+    "_visual": (2.0, 0.0),   # vector visual de una imagen ya indexada
 }
 
 
@@ -82,9 +84,17 @@ class CostModel:
 
 
 def backlog_seconds(conn: sqlite3.Connection, model: CostModel | None = None) -> float:
-    """Tiempo estimado para lo pendiente y lo que falta de los PDF a medias."""
+    """Tiempo estimado para lo pendiente, lo que falta de los PDF a medias, los vectores por
+    recalcular tras un cambio de modelo y los vectores visuales de imágenes en cola."""
     model = model or CostModel.load(conn)
-    total = 0.0
+    gen = int(db.get_meta(conn, "model_gen", "0"))
+    segs = conn.execute("SELECT count(*) FROM segments s JOIN files f ON f.id = s.file_id "
+                        "WHERE f.emb < ? AND f.status != 'pending'", (gen,)).fetchone()[0] if gen else 0
+    total = model.estimate("_reembed", 0, segs / 100)
+    images = conn.execute("SELECT count(*) FROM files WHERE kind = 'image' AND visual = 0 AND status = 'indexed'"
+                          ).fetchone()[0]
+    if images and db.get_meta(conn, "vision") == "1":
+        total += model.estimate("_visual", images, 0.0)
     for r in conn.execute("SELECT kind, count(*) n, coalesce(sum(size), 0) b FROM files "
                           "WHERE status = 'pending' GROUP BY kind"):
         total += model.estimate(r["kind"], r["n"], r["b"] / 1e6)
