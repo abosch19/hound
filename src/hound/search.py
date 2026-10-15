@@ -26,7 +26,7 @@ from . import db
 from .config import Config
 from .embed import Embedder
 from .extract import KINDS
-from .paths import display_path, is_under, parse_user_path
+from .paths import display_path, file_url, is_under, links, parse_user_path
 from .security import SecurityProvider
 
 log = logging.getLogger("hound.search")
@@ -496,6 +496,7 @@ class SearchIndex:
                 "score": round(min(1.0, score / max_score), 3),
                 "similarity": round(sim[sid], 3) if sid in sim else None,
                 "matches": 1,
+                **links(rel, self.cfg),
             }
         return list(results.values())
 
@@ -529,6 +530,7 @@ class SearchIndex:
         status = c.execute("SELECT status, error FROM files WHERE id = ?", (fid,)).fetchone()
         return {
             "path": display_path(rel, self.cfg),
+            **links(rel, self.cfg),
             "modified": _fmt_date(self.files.mtime[fi]),
             "total_segments": total,
             "segments": parts,
@@ -549,14 +551,16 @@ class SearchIndex:
                 continue
             parts = p.split("/")
             if len(parts) == depth + 1:
-                files.append({"name": parts[-1], "path": display_path(p, self.cfg),
+                files.append({"name": parts[-1], "path": display_path(p, self.cfg), **links(p, self.cfg),
                               "modified": _fmt_date(self.files.mtime[i])})
             else:
                 folders[parts[depth]] = folders.get(parts[depth], 0) + 1
         files.sort(key=lambda f: f["name"].lower())
         return {
             "path": display_path(rel, self.cfg),
-            "folders": [{"name": k, "path": display_path(f"{rel}/{k}" if rel else k, self.cfg), "files": v}
+            "folder_url": file_url(rel, self.cfg, folder=True),
+            "folders": [{"name": k, "path": display_path(f"{rel}/{k}" if rel else k, self.cfg),
+                         "folder_url": file_url(f"{rel}/{k}" if rel else k, self.cfg, folder=True), "files": v}
                         for k, v in sorted(folders.items(), key=lambda x: x[0].lower())],
             "files": files[:limit],
             "truncated": len(files) > limit,
@@ -571,4 +575,5 @@ class SearchIndex:
         order = idx[np.argsort(-self.files.mtime[idx])[:limit]]
         return [{"name": self.files.paths[i].rpartition("/")[2],
                  "path": display_path(self.files.paths[i], self.cfg),
+                 **links(self.files.paths[i], self.cfg),
                  "modified": _fmt_date(self.files.mtime[i])} for i in order]

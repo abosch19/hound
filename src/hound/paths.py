@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import fnmatch
 import os
+from urllib.parse import quote
 
 from .config import Config
 
@@ -35,6 +36,29 @@ def display_path(rel: str, cfg: Config) -> str:
     sep = "\\" if ("\\" in base or base.endswith(":")) else "/"
     base = base.rstrip("\\/")
     return base + sep + rel.replace("/", sep) if rel else base
+
+
+def file_url(rel: str, cfg: Config, folder: bool = False) -> str | None:
+    """Enlace file:// a la ruta UNC (file://SERVIDOR/Recurso/carpeta/fichero.pdf).
+
+    En Windows, al pulsarlo se abre el fichero con su programa, o el Explorador si es una
+    carpeta. Sin `share.unc` no hay enlace: la ruta local solo existe en el servidor.
+    """
+    unc = cfg.share.unc.replace("\\", "/").strip("/")
+    if not unc:
+        return None
+    parts = [*unc.split("/"), *(norm_rel(rel).split("/") if norm_rel(rel) else [])]
+    host, rest = parts[0], parts[1:]
+    url = "file://" + quote(host, safe="") + "/" + "/".join(quote(p, safe="") for p in rest)
+    return url + "/" if folder and not url.endswith("/") else url
+
+
+def links(rel: str, cfg: Config) -> dict:
+    """file_url (abre el fichero) y folder_url (abre su carpeta en el Explorador)."""
+    url = file_url(rel, cfg)
+    if url is None:
+        return {}
+    return {"file_url": url, "folder_url": file_url(rel.rpartition("/")[0], cfg, folder=True)}
 
 
 def parse_user_path(path: str, cfg: Config) -> str:

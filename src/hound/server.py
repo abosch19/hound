@@ -35,7 +35,9 @@ Solo devuelve ficheros que el usuario puede abrir en el disco con sus permisos.
 - list_folder y recent_files: para explorar.
 - index_status: cómo va la indexación (progreso, pendientes, ritmo, tiempo estimado). Úsalo si una
   búsqueda no encuentra algo que debería estar: puede que aún no se haya indexado.
-Las rutas se devuelven como rutas UNC que el usuario puede abrir en el Explorador de Windows.
+Las rutas se devuelven como rutas UNC (\\\\SERVIDOR\\Recurso\\...). Cuando hay file_url y folder_url,
+muestra siempre cada fichero como enlace Markdown que se pueda pulsar: [nombre](file_url), y al lado
+[abrir carpeta](folder_url). En Windows el primero abre el fichero y el segundo, el Explorador en su carpeta.
 """
 
 

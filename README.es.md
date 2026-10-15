@@ -185,6 +185,8 @@ Hound expone estas herramientas:
 | `recent_files(limit?, folder?)` | Últimos ficheros modificados |
 | `index_status()` | Cómo va la indexación: fase, progreso, ficheros pendientes, ritmo y tiempo estimado que queda |
 
+Con `share.unc` configurado, los resultados incluyen también `file_url` y `folder_url` (`file://SERVIDOR/Recurso/...`), y Claude los muestra como enlaces que se pueden pulsar: en Windows el primero abre el fichero con su programa y el segundo abre el Explorador en su carpeta. El ordenador del usuario debe poder acceder a la carpeta compartida (red de la oficina o VPN).
+
 Otras órdenes para gestionar los tokens:
 
 ```powershell

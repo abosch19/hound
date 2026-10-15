@@ -185,6 +185,8 @@ Hound exposes these tools:
 | `recent_files(limit?, folder?)` | Most recently modified files |
 | `index_status()` | How the indexing is going: phase, progress, pending files, rate and estimated time left |
 
+With `share.unc` set, results also include `file_url` and `folder_url` (`file://SERVER/Share/...`), and Claude shows them as clickable links: on Windows the first opens the file with its program and the second opens File Explorer in its folder. The user's computer must be able to reach the shared folder (office network or VPN).
+
 Other commands to manage tokens:
 
 ```powershell

@@ -96,6 +96,9 @@ def test_herramientas_y_busqueda(server):
     first = _payload(res)["results"][0]
     assert first["name"] == "contrato_limpieza_2024.pdf"
     assert first["path"].startswith("\\\\SERVIDOR\\Compartido\\")
+    assert first["file_url"].startswith("file://SERVIDOR/Compartido/") and first["file_url"].endswith(
+        "/contrato_limpieza_2024.pdf")
+    assert first["file_url"].startswith(first["folder_url"]) and first["folder_url"].endswith("/")
     _names, res = _call(url, tokens["alice"], "read_document", {"path": first["path"], "start": 1})
     assert _payload(res)["segments"][0]["location"] == "página 2"
     store.flush()

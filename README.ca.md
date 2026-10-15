@@ -185,6 +185,8 @@ Hound ofereix aquestes eines:
 | `recent_files(limit?, folder?)` | Últims fitxers modificats |
 | `index_status()` | Com va la indexació: fase, progrés, fitxers pendents, ritme i temps estimat que queda |
 
+Amb `share.unc` configurat, els resultats inclouen també `file_url` i `folder_url` (`file://SERVIDOR/Recurs/...`), i Claude els mostra com a enllaços que es poden prémer: a Windows el primer obre el fitxer amb el seu programa i el segon obre l'Explorador a la seva carpeta. L'ordinador de l'usuari ha de poder accedir a la carpeta compartida (xarxa de l'oficina o VPN).
+
 Altres ordres per gestionar els tokens:
 
 ```powershell
