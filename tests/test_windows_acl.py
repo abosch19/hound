@@ -31,7 +31,8 @@ def _run(*cmd):
 def accounts():
     for u in USERS:
         subprocess.run(["net", "user", u, "/delete"], capture_output=True)
-        _run("net", "user", u, "Hx!" + secrets.token_urlsafe(16), "/add")
+        # 14 caracteres como máximo: con más, "net user" pide confirmación y falla sin consola.
+        _run("net", "user", u, "Hx9!" + secrets.token_hex(5), "/add")
     yield USERS
     for u in USERS:
         subprocess.run(["net", "user", u, "/delete"], capture_output=True)
