@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Tesseract (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr tesseract-ocr-spa
+      - run: uv pip install -e ".[dev]"
+      - name: Tests
+        env:
+          HOUND_WIN_ACL_TESTS: "1"   # en Windows crea usuarios locales y ACL reales
+        run: python -m pytest -v
+
+  installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar con install.ps1 (desde el código del commit)
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force C:\Compartido\Obras | Out-Null
+          Set-Content C:\Compartido\Obras\presupuesto.txt "Presupuesto de la reforma de la cocina"
+          .\install.ps1 -SharePath C:\Compartido -Source $PWD -AllowFrom 10.8.0.0/24
+      - name: Comprobar el servicio y el MCP
+        shell: powershell
+        run: |
+          $env:Path += ";$env:ProgramFiles\Hound\bin"
+          $env:HOUND_CONFIG = "$env:ProgramData\Hound\config.toml"
+          if ((Get-Service Hound).Status -ne "Running") { throw "El servicio no está en marcha" }
+          Start-Sleep -Seconds 60
+          hound status
+          $out = hound token create runneradmin --label ci
+          $token = ($out | Select-String -Pattern 'hound_[A-Za-z0-9_-]+').Matches[0].Value
+          $headers = @{ Authorization = "Bearer $token"; Accept = "application/json, text/event-stream"; "MCP-Protocol-Version" = "2025-06-18" }
+          $body = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_files","arguments":{"query":"reforma de la cocina"}}}'
+          $r = Invoke-RestMethod -Uri http://localhost:8765/mcp -Method Post -Headers $headers -Body $body -ContentType "application/json"
+          $r | ConvertTo-Json -Depth 10
+          if (($r | ConvertTo-Json -Depth 10) -notmatch "presupuesto.txt") { throw "La búsqueda no encontró el fichero" }
+      - name: Registros
+        if: always()
+        shell: powershell
+        run: Get-ChildItem "$env:ProgramData\Hound\logs" | ForEach-Object { "== $_"; Get-Content $_.FullName -Tail 80 }
+      - name: Desinstalar
+        shell: powershell
+        run: .\uninstall.ps1 -Purge
