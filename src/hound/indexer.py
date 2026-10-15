@@ -30,6 +30,7 @@ from .embed import Embedder
 from .extract import ExtractOptions, Extracted, capabilities, extract, extractor_tag, kind_of
 from .paths import Excluder, norm_rel, to_abs
 from .security import SecurityProvider
+from .status import set_state
 
 log = logging.getLogger("hound.indexer")
 
@@ -160,6 +161,10 @@ class Indexer:
                 stats.deleted += 1
             self.conn.commit()
             return stats
+        full = not subtree and recursive
+        if full:
+            set_state(self.conn, "scanning", seen=0)
+            self.conn.commit()
         known = self._known(subtree, recursive)
         failed_dirs: list[str] = []
         start = to_abs(subtree, self.root)
@@ -204,6 +209,8 @@ class Indexer:
                         log.warning("Error al examinar %s: %s", rel, exc)
                     pending_commit += 1
                     if pending_commit >= 1000:
+                        if full:
+                            set_state(self.conn, "scanning", seen=stats.seen)
                         self.conn.commit()
                         pending_commit = 0
         # Lo que queda en `known` ya no está en el disco (salvo en carpetas que no se pudieron leer).
@@ -398,6 +405,7 @@ class Indexer:
                               db.next_seq(conn), row["id"]))
                 if err:
                     log.info("%s: %s", row["path"], err)
+            set_state(conn, "indexing")  # latido: un lote con OCR puede tardar mucho
         return len(batch)
 
     # --- vigilancia ---------------------------------------------------------------
@@ -472,13 +480,17 @@ class Indexer:
                 mode = self.cfg.index.schedule.busy_mode if busy else "normal"
                 backlog = self.conn.execute("SELECT count(*) FROM files WHERE status = 'pending'").fetchone()[0]
                 if mode == "pause" and backlog > 200:
+                    set_state(self.conn, "paused")
+                    self.conn.commit()
                     stop.wait(60)  # carga inicial: se espera a que acabe la jornada
                     continue
                 throttle = self.cfg.index.schedule.busy_pause_ms / 1000 if mode in ("slow", "pause") else 0.0
-                db.set_meta(self.conn, "indexer_heartbeat", str(time.time()))
+                set_state(self.conn, "indexing" if backlog else "idle")
                 self.conn.commit()
                 n = self.process_pending(max_files=50 if busy else 200, stop=stop, throttle=throttle)
                 if n == 0:
+                    set_state(self.conn, "idle")
+                    self.conn.commit()
                     stop.wait(5)
         finally:
             if observer is not None:

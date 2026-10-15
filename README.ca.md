@@ -2,16 +2,16 @@
 
 [English](README.md) · [Español](README.es.md) · **Català**
 
-Cercador semàntic per a la carpeta compartida d'un Windows Server, consultable des de **Claude Code** per **MCP**.
+Cercador semàntic per a la carpeta compartida d'un Windows Server o d'un servidor Linux (Samba), consultable des de **Claude Code** per **MCP**.
 
 Hound indexa els fitxers de la carpeta compartida i permet trobar-los pel seu significat ("el contracte amb el proveïdor de neteja", "la factura de març d'en Pérez", "el pressupost de la reforma"), no només pel nom. Funciona sencer dins del servidor:
 
 - **No surt res del servidor en indexar.** El text s'extreu i els embeddings es calculen en local, a la CPU.
-- **Cada cerca respecta els permisos NTFS de l'usuari que pregunta.** Si algú no pot obrir un fitxer al disc, tampoc no en veu el nom ni cap fragment.
+- **Cada cerca respecta els permisos de fitxer de l'usuari que pregunta** (ACL de NTFS a Windows; propietari, grup, bits de mode i ACL POSIX a Linux). Si algú no pot obrir un fitxer al disc, tampoc no en veu el nom ni cap fragment.
 - **No modifica mai la carpeta compartida.** Només la llegeix.
 
 ```
- Ordinador del treballador (VPN)                  Windows Server
+ Ordinador del treballador (VPN)                  Windows Server / Linux
 ┌────────────────────────┐   HTTP + token   ┌──────────────────────────────────────────┐
 │ Claude Code            │ ───────────────► │ Servei "Hound"                            │
 │  └─ MCP "hound"        │     /mcp         │  ├─ Servidor MCP (cerca + permisos)       │
@@ -41,12 +41,16 @@ Cada resultat indica **on** és la coincidència: "página 3", "hoja Gastos, fil
 
 ## Requisits
 
-- Windows Server 2016 o posterior, de 64 bits, amb accés a internet durant la instal·lació.
+- **Windows:** Windows Server 2016 o posterior, de 64 bits.
+- **Linux:** una distribució de 64 bits (x86_64 o aarch64) amb systemd: Debian/Ubuntu, RHEL/Rocky/Alma (amb EPEL), Fedora, openSUSE o Arch. La carpeta compartida sol servir-se amb Samba.
+- Accés a internet durant la instal·lació.
 - Uns 2 GB de disc per al programa i el model, més l'índex: uns 4–5 KB per fragment. Amb 1 milió de fragments són uns 5 GB.
 - RAM per als vectors en memòria: uns 3 KB per fragment. Amb 1 milió són uns 3 GB, o la meitat amb `memory_dtype = "float16"`.
 - No necessita GPU.
 
 ## Instal·lació
+
+### Windows Server
 
 Al servidor, obre **PowerShell com a administrador** i executa:
 
@@ -88,19 +92,54 @@ L'instal·lador fa el següent:
 7. Activa a Windows el suport de rutes llargues (`LongPathsEnabled`).
 8. Obre el port al tallafoc només per a `-AllowFrom`.
 
-En acabar, l'índex comença a construir-se en segon pla. Per veure'n el progrés:
+### Linux
 
-```powershell
-hound status
+Al servidor, com a root (o amb `sudo`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/abosch19/hound/main/install.sh | sudo bash -s -- --share /srv/shared --allow-from 10.8.0.0/24
 ```
+
+Sense `--share`, es llegeixen els recursos de Samba amb `testparm`: si n'hi ha un de sol s'utilitza, i si n'hi ha diversos pregunta quin.
+
+| Paràmetre | Per defecte | Què és |
+|---|---|---|
+| `--share` | es detecta | Ruta local de la carpeta compartida |
+| `--allow-from` | subxarxa local | Xarxa o xarxes que poden connectar-se al MCP, p. ex. la de la VPN. Separades per comes |
+| `--port` | `8765` | Port del MCP |
+| `--share-name` / `--unc` | es detecten | Nom del recurs de Samba i ruta `\\SERVIDOR\Recurs` que es mostra als resultats |
+| `--ocr-languages` | `spa,eng` | Idiomes d'OCR (p. ex. `spa,eng,cat`) |
+| `--version` | `main` | Branca o etiqueta de GitHub |
+| `--no-ocr` / `--no-firewall` / `--no-service` | | No instal·la Tesseract, ni toca el tallafoc, ni crea el servei de systemd |
+
+L'instal·lador fa el següent:
+
+1. Instal·la `uv` i un Python 3.12 propi a `/opt/hound`, sense tocar el Python del sistema.
+2. Instal·la Hound i les seves dependències.
+3. Instal·la Tesseract i els idiomes d'OCR amb el gestor de paquets del sistema (apt, dnf/yum, zypper o pacman).
+4. Descarrega el model d'embeddings, una sola vegada.
+5. Crea `/etc/hound/config.toml` (amb `permissions.mode = "posix"`); l'índex, els tokens i els registres van a `/var/lib/hound`, llegible només per root.
+6. Registra el servei **hound** de systemd: arrencada automàtica i reinici si falla. S'executa com a root per poder llegir tota la carpeta, però amb les capacitats reduïdes a la lectura de fitxers (`CAP_DAC_READ_SEARCH`) i la resta del sistema en només lectura.
+7. Puja `fs.inotify.max_user_watches` si cal, perquè la vigilància de canvis pugui cobrir carpetes grans.
+8. Obre el port només per a `--allow-from` amb **ufw** o **firewalld**, el que sigui actiu. Si no n'hi ha cap, t'avisa que has de restringir el port tu.
+9. Instal·la l'ordre `hound` a `/usr/local/bin` (fes-la servir amb `sudo`).
+
+### Seguir la indexació
+
+En acabar la instal·lació, el servidor MCP ja respon i l'índex es construeix en segon pla. El servidor MCP és el primer que arrenca: l'indexador només comença quan el port ja és obert, de manera que pots seguir el progrés des del principi.
+
+- Des del servidor: `hound status` (a Linux, `sudo hound status`).
+- Des de Claude Code: pregunta *"com va la indexació de Hound?"*. L'eina `index_status` retorna la fase (escanejant, indexant, en pausa, al dia, aturat), el percentatge, els fitxers pendents i amb error, els fitxers per hora, el temps estimat que queda i quants fitxers pots veure. Només retorna recomptes, mai rutes.
 
 > **Indexació inicial.** Amb molts fitxers (sobretot PDF escanejats i imatges amb OCR), la primera indexació pot durar hores o dies. En horari laboral l'indexador va a poc a poc, amb prioritat baixa de CPU i disc. Si prefereixes que només treballi de nit, posa `busy_mode = "pause"` a `config.toml`. Després només processa els canvis.
 
 ### Actualitzar
 
-Torna a executar la mateixa ordre d'instal·lació. Es conserven la configuració, l'índex i els tokens.
+Torna a executar la mateixa ordre d'instal·lació (`install.ps1` o `install.sh`). Es conserven la configuració, l'índex i els tokens.
 
 ### Desinstal·lar
+
+A Windows:
 
 ```powershell
 irm https://raw.githubusercontent.com/abosch19/hound/main/uninstall.ps1 | iex
@@ -112,15 +151,23 @@ Conserva les dades a `C:\ProgramData\Hound`. Per esborrar-les també:
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/abosch19/hound/main/uninstall.ps1))) -Purge
 ```
 
+A Linux (es conserven les dades de `/etc/hound` i `/var/lib/hound`, tret que afegeixis `--purge`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/abosch19/hound/main/uninstall.sh | sudo bash -s -- --purge
+```
+
+Tesseract no es desinstal·la en cap dels dos sistemes, perquè altres programes poden fer-lo servir.
+
 ## Afegir un usuari i connectar Claude Code
 
-Cada treballador fa servir un **token personal** associat al **seu compte de Windows**. Les cerques es fan amb els permisos d'aquest compte. Al servidor, com a administrador:
+Cada treballador fa servir un **token personal** associat al **seu compte al servidor** (Windows, o Linux/Samba). Les cerques es fan amb els permisos d'aquest compte. Al servidor, com a administrador (a Linux, amb `sudo`):
 
 ```powershell
 hound token create maria --host SERVIDOR
 ```
 
-El compte pot ser `maria`, `EQUIP\maria` o `DOMINI\maria`: local si el servidor és en un grup de treball, o del domini si hi ha Active Directory. L'ordre mostra el token **una sola vegada** i l'ordre exacta que la persona ha d'executar al seu ordinador, amb la VPN connectada:
+El compte pot ser `maria`, `EQUIP\maria` o `DOMINI\maria`: local si el servidor és en un grup de treball, o del domini si hi ha Active Directory. A Linux serveix qualsevol compte que el sistema conegui (`getent passwd maria`), també els del domini mitjançant winbind o sssd. L'ordre mostra el token **una sola vegada** i l'ordre exacta que la persona ha d'executar al seu ordinador, amb la VPN connectada:
 
 ```bash
 claude mcp add --transport http --scope user hound http://SERVIDOR:8765/mcp --header "Authorization: Bearer hound_..."
@@ -136,6 +183,7 @@ Hound ofereix aquestes eines:
 | `read_document(path, start?, end?)` | Text extret del fitxer per trams, sense carregar-lo sencer |
 | `list_folder(path?)` | Subcarpetes i fitxers visibles per a l'usuari |
 | `recent_files(limit?, folder?)` | Últims fitxers modificats |
+| `index_status()` | Com va la indexació: fase, progrés, fitxers pendents, ritme i temps estimat que queda |
 
 Altres ordres per gestionar els tokens:
 
@@ -151,6 +199,8 @@ Un token revocat deixa de funcionar en menys de 30 segons.
 
 ## Permisos
 
+### Windows (NTFS)
+
 - En indexar, Hound desa el descriptor de seguretat NTFS de cada fitxer: propietari, grup i ACL.
 - En cercar, comprova amb l'API **Authz** de Windows si el compte del token pot llegir cada fitxer. Té en compte grups, grups niats, herència i permisos de "Denegar", igual que el mateix Windows.
 - La comprovació es fa **abans** d'ordenar els resultats, de manera que un fitxer sense permís no apareix mai: ni a les cerques, ni a `read_document`, ni a `list_folder`, ni a `recent_files`.
@@ -163,6 +213,13 @@ Altres punts a tenir en compte:
 - **Compte del servei.** El servei s'executa com a `SYSTEM`, que ha de poder llegir la carpeta compartida (és l'habitual). `hound doctor` ho comprova.
 - **Servidor en domini.** Per calcular els grups d'un usuari del domini, el compte d'equip del servidor ha de poder llegir l'atribut `tokenGroupsGlobalAndUniversal`. Normalment ja pot; si `hound search --as DOMINI\usuari` falla, afegeix l'equip al grup **Windows Authorization Access Group** del domini.
 - **Mode sense permisos.** Amb `permissions.mode = "none"` tots els usuaris amb token veuen tot l'índex. Fes-lo servir només si de debò tothom pot veure-ho tot.
+
+### Linux (POSIX)
+
+- En indexar, Hound desa el propietari, el grup, els bits de mode i l'ACL POSIX (`setfacl`) de cada fitxer, a més dels de cada carpeta des de l'arrel del recurs fins a ell.
+- En cercar, aplica la mateixa comprovació que fa el nucli quan Samba obre un fitxer en nom de l'usuari: permís de lectura sobre el fitxer i de pas (`x`) a totes les carpetes del camí. Els grups es resolen amb NSS, de manera que funcionen els comptes locals, de winbind i de sssd, incloses les entrades d'ACL d'usuari i de grup amb nom i la màscara de l'ACL.
+- Tota la resta funciona com a Windows: es comprova abans d'ordenar, es denega davant del dubte i els canvis es recullen al següent reescaneig.
+- No ho cobreix: les regles exclusives de Samba a `smb.conf` (`valid users`, `read list`, `force user`…) ni les ACL de Windows desades per `vfs_acl_xattr` que no es reflecteixin a les ACL POSIX. Si en depens, fes servir exclusions o comprova-ho amb `hound search --as`.
 
 Per comprovar què veuria un usuari concret:
 
@@ -186,7 +243,7 @@ El que s'exclou no s'indexa ni es pot consultar, i el que ja estigués indexat s
 DWG és un format tancat. Per llegir-ne el contingut (textos, caixetins, capes):
 
 1. Descarrega i instal·la **ODA File Converter**, gratuït, des de https://www.opendesign.com/guestfiles/oda_file_converter. L'instal·lador no l'inclou perquè cal acceptar-ne la llicència manualment.
-2. Reinicia el servei amb `Restart-Service Hound`. Hound el detecta a `C:\Program Files\ODA\` i torna a processar automàticament els DWG que abans s'havien indexat només pel nom.
+2. Reinicia el servei amb `Restart-Service Hound` (Linux: `sudo systemctl restart hound`). Hound el detecta a `C:\Program Files\ODA\` a Windows, o com a `ODAFileConverter` al `PATH` a Linux (el paquet `.deb`/`.rpm` l'instal·la a `/usr/bin`), i torna a processar automàticament els DWG que abans s'havien indexat només pel nom.
 
 Si és en una altra ruta, indica-la a `[cad] oda_converter`.
 
@@ -194,7 +251,7 @@ Si és en una altra ruta, indica-la a `[cad] oda_converter`.
 
 | Ordre | Per a què |
 |---|---|
-| `hound status` | Fitxers indexats, pendents i amb error; últim escaneig; si l'indexador és actiu |
+| `hound status` | Fase de l'indexador, progrés, fitxers pendents i amb error, ritme i temps estimat que queda (igual que l'eina `index_status`) |
 | `hound errors` | Fitxers que no s'han pogut llegir i per què (PDF amb contrasenya, fitxers malmesos…) |
 | `hound log --user maria` | Registre de consultes: qui ha cercat què i quan |
 | `hound doctor` | Comprova carpeta, model, Tesseract, ODA i permisos |
@@ -202,29 +259,29 @@ Si és en una altra ruta, indica-la a `[cad] oda_converter`.
 | `hound reindex --path "Obres\2024"` | Torna a indexar una carpeta o un fitxer |
 | `hound reindex --all` | Refà l'índex sencer (p. ex. després de canviar de model). Conserva els tokens i el registre |
 | `hound backup D:\Copies` | Còpia de seguretat en calent de l'índex |
-| `Restart-Service Hound` | Aplica els canvis de `config.toml` |
+| `Restart-Service Hound` / `sudo systemctl restart hound` | Aplica els canvis de `config.toml` |
 
-Els registres són a `C:\ProgramData\Hound\logs`.
+Els registres són a `C:\ProgramData\Hound\logs` a Windows, i a `/var/lib/hound/logs` i `journalctl -u hound` a Linux. A Linux, executa aquestes ordres amb `sudo`.
 
 ### Còpia de seguretat i restauració
 
-L'índex (`C:\ProgramData\Hound\index.sqlite`) inclou els usuaris, els tokens i el registre de consultes. Per fer-ne la còpia sense aturar el servei:
+L'índex (`C:\ProgramData\Hound\index.sqlite`, o `/var/lib/hound/index.sqlite` a Linux) inclou els usuaris, els tokens i el registre de consultes. Per fer-ne la còpia sense aturar el servei:
 
 ```powershell
 hound backup D:\Copies
 ```
 
-La pots programar amb el Programador de tasques. Per restaurar-la:
+La pots programar amb el Programador de tasques (a Linux, `sudo hound backup /backups` des de cron o un temporitzador de systemd). Per restaurar-la:
 
-1. `Stop-Service Hound`.
+1. `Stop-Service Hound` (Linux: `sudo systemctl stop hound`).
 2. Copia el fitxer damunt d'`index.sqlite` i esborra `index.sqlite-wal` i `index.sqlite-shm` si existeixen.
-3. `Start-Service Hound`.
+3. `Start-Service Hound` (Linux: `sudo systemctl start hound`).
 
 Si es perd l'índex, no es perd res de la carpeta compartida: n'hi ha prou amb `hound reindex --all` i tornar a crear els tokens.
 
 ## Configuració
 
-El fitxer és `C:\ProgramData\Hound\config.toml`. Després de canviar-lo, executa `Restart-Service Hound`.
+El fitxer és `C:\ProgramData\Hound\config.toml` a Windows i `/etc/hound/config.toml` a Linux. Després de canviar-lo, executa `Restart-Service Hound` o `sudo systemctl restart hound`.
 
 | Secció | Opció | Per defecte | Descripció |
 |---|---|---|---|
@@ -268,7 +325,7 @@ Sobre HTTPS: dins de la VPN el trànsit ja va xifrat. Si tot i així vols fer se
   Amb 1 milió de fragments, la part vectorial triga uns 120 ms.
 - **Indexació incremental:**
   - un reescaneig periòdic compara la mida, la data i els permisos de cada fitxer;
-  - la vigilància de canvis (`ReadDirectoryChangesW`) reacciona a l'instant;
+  - la vigilància de canvis (`ReadDirectoryChangesW` a Windows, inotify a Linux) reacciona a l'instant;
   - l'extracció s'executa en processos a part amb un temps màxim per fitxer, i un fitxer que falla es registra sense aturar res.
 
 ## Limitacions conegudes
@@ -276,6 +333,7 @@ Sobre HTTPS: dins de la VPN el trànsit ja va xifrat. Si tot i així vols fer se
 - Els `.doc` i `.ppt` antics (format binari) s'indexen només pel nom.
 - Les imatges es cerquen pel text que contenen (OCR), no pel que mostren. La cerca de fotos pel contingut i l'àudio queden per a una fase posterior.
 - Les etiquetes d'ubicació i els missatges del servidor són en castellà.
+- Les rutes es comparen sense distingir majúscules, com a Windows. A Linux, dos fitxers de la mateixa carpeta els noms dels quals només es diferencien en les majúscules s'indexen com un de sol.
 
 ## Desenvolupament
 
@@ -285,6 +343,7 @@ python -m pytest
 ```
 
 - Els tests de permisos amb ACL reals (`tests/test_windows_acl.py`) creen usuaris locals: només s'executen a Windows amb `HOUND_WIN_ACL_TESTS=1`. La CI de GitHub ho fa a `windows-latest`, juntament amb una instal·lació completa amb `install.ps1`.
+- Els tests de permisos POSIX (`tests/test_posix_acl.py`) s'executen a Linux i macOS; el d'ACL reals necessita `setfacl`. La CI també fa una instal·lació completa a `ubuntu-latest` amb `install.sh`, comprova que una carpeta sense permís continua amagada i desinstal·la.
 - `HOUND_BENCH=1` activa la prova de rendiment amb 1 milió de fragments.
 
 L'encàrrec original (en castellà) és a [docs/PROMPT.md](docs/PROMPT.md).

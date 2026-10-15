@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import glob
 import os
+import shutil
 import sys
 from functools import lru_cache
 
@@ -25,7 +26,7 @@ def _find_oda(configured: str) -> str | None:
     if sys.platform == "win32":
         found = sorted(glob.glob(r"C:\Program Files\ODA\ODAFileConverter*\ODAFileConverter.exe"))
         return found[-1] if found else None
-    return None
+    return shutil.which("ODAFileConverter")
 
 
 def oda_available(cfg: CadConfig) -> bool:
@@ -42,7 +43,7 @@ def _load(path: str, cfg: CadConfig):
             return None
         from ezdxf.addons import odafc
 
-        ezdxf.options.set("odafc-addon", "win_exec_path", exe)
+        ezdxf.options.set("odafc-addon", "win_exec_path" if sys.platform == "win32" else "unix_exec_path", exe)
         try:
             return odafc.readfile(path)
         except Exception as exc:  # noqa: BLE001

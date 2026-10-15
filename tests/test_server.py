@@ -121,3 +121,44 @@ def test_token_revocado(server):
     store._cache.clear()
     r = httpx.post(url + "/mcp", json={}, headers={"Authorization": f"Bearer {tokens['bob']}"})
     assert r.status_code == 401
+
+
+def test_index_status(server):
+    url, tokens, _conn, _store = server
+    names, res = _call(url, tokens["bob"], "index_status", {})
+    assert "index_status" in names
+    st = _payload(res)
+    assert st["files"]["pending"] == 0 and st["files"]["total"] == st["files"]["indexed"] + st["files"]["errors"]
+    assert st["progress_percent"] == 100.0
+    assert st["search_index"] == "listo"
+    # bob no ve RRHH: ve menos ficheros de los que hay, y no se devuelve ninguna ruta
+    assert 0 < st["files_visible_to_you"] < st["files"]["total"]
+    assert "rrhh" not in json.dumps(st).lower()
+
+
+def test_mcp_responde_mientras_carga_el_indice(cfg, corpus):
+    """El servidor arranca antes que el índice: index_status funciona y la búsqueda avisa."""
+    import uvicorn
+
+    sec = FakeSecurity(str(corpus))
+    sec.add_user("bob", "S-BOB")
+    conn = db.init_db(cfg.db_path)
+    _, bob = create_token(conn, sec, "bob")
+    app = build_app(lambda: None, TokenStore(cfg.db_path), lambda: {"indexer_process": {"running": True}})
+    port = _free_port()
+    srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+    t = threading.Thread(target=srv.run, daemon=True)
+    t.start()
+    while not srv.started:
+        time.sleep(0.05)
+    try:
+        url = f"http://127.0.0.1:{port}"
+        _n, res = _call(url, bob, "index_status", {})
+        st = _payload(res)
+        assert st["search_index"] == "cargando" and st["phase"] == "stopped"
+        assert st["indexer_process"] == {"running": True}
+        _n, res = _call(url, bob, "search_files", {"query": "algo"})
+        assert res.is_error and "cargando" in res.content[0].text
+    finally:
+        srv.should_exit = True
+        t.join(5)

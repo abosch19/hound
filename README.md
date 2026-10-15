@@ -2,16 +2,16 @@
 
 **English** · [Español](README.es.md) · [Català](README.ca.md)
 
-Semantic search for the shared folder on a Windows Server, queried from **Claude Code** over **MCP**.
+Semantic search for the shared folder on a Windows Server or a Linux (Samba) server, queried from **Claude Code** over **MCP**.
 
 Hound indexes the files in the shared folder so you can find them by meaning ("the contract with the cleaning supplier", "Pérez's March invoice", "the renovation quote"), not just by name. Everything runs on the server:
 
 - **Nothing leaves the server while indexing.** Text extraction and embeddings run locally, on the CPU.
-- **Every search respects the NTFS permissions of the person asking.** If someone can't open a file on disk, they don't see its name or any excerpt from it.
+- **Every search respects the file permissions of the person asking** (NTFS ACLs on Windows; owner, group, mode bits and POSIX ACLs on Linux). If someone can't open a file on disk, they don't see its name or any excerpt from it.
 - **It never modifies the shared folder.** It only reads it.
 
 ```
- Employee's computer (VPN)                        Windows Server
+ Employee's computer (VPN)                        Windows Server / Linux
 ┌────────────────────────┐   HTTP + token   ┌──────────────────────────────────────────┐
 │ Claude Code            │ ───────────────► │ "Hound" service                           │
 │  └─ MCP "hound"        │     /mcp         │  ├─ MCP server (search + permissions)     │
@@ -41,12 +41,16 @@ Each result says **where** the match is: "página 3" (page 3), "hoja Gastos, fil
 
 ## Requirements
 
-- Windows Server 2016 or later, 64-bit, with internet access during installation.
+- **Windows:** Windows Server 2016 or later, 64-bit.
+- **Linux:** a 64-bit (x86_64 or aarch64) distribution with systemd: Debian/Ubuntu, RHEL/Rocky/Alma (with EPEL), Fedora, openSUSE or Arch. The shared folder is usually served with Samba.
+- Internet access during installation.
 - About 2 GB of disk for the program and the model, plus the index: about 4–5 KB per fragment. With 1 million fragments that's about 5 GB.
 - RAM for the in-memory vectors: about 3 KB per fragment. With 1 million that's about 3 GB, or half with `memory_dtype = "float16"`.
 - No GPU needed.
 
 ## Installation
+
+### Windows Server
 
 On the server, open **PowerShell as administrator** and run:
 
@@ -88,19 +92,54 @@ The installer does the following:
 7. Enables long path support in Windows (`LongPathsEnabled`).
 8. Opens the port in the firewall only for `-AllowFrom`.
 
-When it finishes, the index starts building in the background. To follow progress:
+### Linux
 
-```powershell
-hound status
+On the server, as root (or with `sudo`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/abosch19/hound/main/install.sh | sudo bash -s -- --share /srv/shared --allow-from 10.8.0.0/24
 ```
+
+Without `--share`, the Samba shares are read with `testparm`: if there's only one it's used, otherwise you're asked which one.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `--share` | detected | Local path of the shared folder |
+| `--allow-from` | local subnet | Network(s) allowed to reach the MCP, e.g. the VPN's. Comma-separated |
+| `--port` | `8765` | MCP port |
+| `--share-name` / `--unc` | detected | Samba share name and the `\\SERVER\Share` path shown in results |
+| `--ocr-languages` | `spa,eng` | OCR languages (e.g. `spa,eng,cat`) |
+| `--version` | `main` | GitHub branch or tag |
+| `--no-ocr` / `--no-firewall` / `--no-service` | | Skip Tesseract, the firewall or the systemd service |
+
+The installer does the following:
+
+1. Installs `uv` and its own Python 3.12 in `/opt/hound`, without touching the system Python.
+2. Installs Hound and its dependencies.
+3. Installs Tesseract and the OCR languages with the system package manager (apt, dnf/yum, zypper or pacman).
+4. Downloads the embedding model, once.
+5. Creates `/etc/hound/config.toml` (with `permissions.mode = "posix"`); index, tokens and logs go to `/var/lib/hound`, readable only by root.
+6. Registers the **hound** systemd service: starts at boot and restarts if it fails. It runs as root to read the whole folder, but with its capabilities reduced to reading files (`CAP_DAC_READ_SEARCH`) and the rest of the system read-only.
+7. Raises `fs.inotify.max_user_watches` if needed, so change monitoring can cover large folders.
+8. Opens the port only for `--allow-from` with **ufw** or **firewalld**, whichever is active. With neither, it warns you to restrict the port yourself.
+9. Installs the `hound` command in `/usr/local/bin` (use it with `sudo`).
+
+### Following the indexing
+
+When installation finishes, the MCP server is already answering and the index builds in the background. The MCP server is the first thing that starts: the indexer only starts once the port is open, so you can follow progress from the very beginning.
+
+- From the server: `hound status` (on Linux, `sudo hound status`).
+- From Claude Code: ask *"how is the Hound indexing going?"*. The `index_status` tool returns the phase (scanning, indexing, paused, up to date, stopped), the percentage, pending and failed files, files per hour, the estimated time left and how many files you can see. It only returns counts, never paths.
 
 > **Initial indexing.** With many files (especially scanned PDFs and images that need OCR), the first indexing run can take hours or days. During working hours the indexer runs slowly, with low CPU and disk priority. If you'd rather it only work at night, set `busy_mode = "pause"` in `config.toml`. After that it only processes changes.
 
 ### Updating
 
-Run the same installation command again. Configuration, index and tokens are kept.
+Run the same installation command again (`install.ps1` or `install.sh`). Configuration, index and tokens are kept.
 
 ### Uninstalling
+
+On Windows:
 
 ```powershell
 irm https://raw.githubusercontent.com/abosch19/hound/main/uninstall.ps1 | iex
@@ -112,15 +151,23 @@ Data in `C:\ProgramData\Hound` is kept. To delete it too:
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/abosch19/hound/main/uninstall.ps1))) -Purge
 ```
 
+On Linux (data in `/etc/hound` and `/var/lib/hound` is kept unless you add `--purge`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/abosch19/hound/main/uninstall.sh | sudo bash -s -- --purge
+```
+
+Tesseract is not removed on either system, since other programs may use it.
+
 ## Adding a user and connecting Claude Code
 
-Each employee uses a **personal token** tied to **their Windows account**. Searches run with that account's permissions. On the server, as administrator:
+Each employee uses a **personal token** tied to **their account on the server** (Windows, or Linux/Samba). Searches run with that account's permissions. On the server, as administrator (on Linux, with `sudo`):
 
 ```powershell
 hound token create maria --host SERVER
 ```
 
-The account can be `maria`, `COMPUTER\maria` or `DOMAIN\maria`: local if the server is in a workgroup, or a domain account if you use Active Directory. The command shows the token **only once**, together with the exact command the person must run on their computer, with the VPN connected:
+The account can be `maria`, `COMPUTER\maria` or `DOMAIN\maria`: local if the server is in a workgroup, or a domain account if you use Active Directory. On Linux it's any account the system knows (`getent passwd maria`), including domain accounts through winbind or sssd. The command shows the token **only once**, together with the exact command the person must run on their computer, with the VPN connected:
 
 ```bash
 claude mcp add --transport http --scope user hound http://SERVER:8765/mcp --header "Authorization: Bearer hound_..."
@@ -136,6 +183,7 @@ Hound exposes these tools:
 | `read_document(path, start?, end?)` | Extracted text of a file, in chunks, without loading all of it |
 | `list_folder(path?)` | Subfolders and files visible to the user |
 | `recent_files(limit?, folder?)` | Most recently modified files |
+| `index_status()` | How the indexing is going: phase, progress, pending files, rate and estimated time left |
 
 Other commands to manage tokens:
 
@@ -151,6 +199,8 @@ A revoked token stops working within 30 seconds.
 
 ## Permissions
 
+### Windows (NTFS)
+
 - When indexing, Hound stores each file's NTFS security descriptor: owner, group and ACL.
 - When searching, it uses the Windows **Authz** API to check whether the token's account can read each file. It accounts for groups, nested groups, inheritance and "Deny" entries, just like Windows itself.
 - The check happens **before** results are ranked, so a file the user can't access never appears: not in searches, `read_document`, `list_folder` or `recent_files`.
@@ -163,6 +213,13 @@ Other things to keep in mind:
 - **Service account.** The service runs as `SYSTEM`, which must be able to read the shared folder (it usually can). `hound doctor` checks this.
 - **Domain-joined server.** To compute a domain user's groups, the server's computer account must be able to read the `tokenGroupsGlobalAndUniversal` attribute. It usually can; if `hound search --as DOMAIN\user` fails, add the computer to the domain's **Windows Authorization Access Group**.
 - **No-permissions mode.** With `permissions.mode = "none"` every user with a token sees the whole index. Only use it if everyone really can see everything.
+
+### Linux (POSIX)
+
+- When indexing, Hound stores each file's owner, group, mode bits and POSIX ACL (`setfacl`), plus those of every folder from the root of the share down to it.
+- When searching, it applies the same check as the kernel when Samba opens a file on the user's behalf: read permission on the file and traverse permission (`x`) on every folder on the way. Groups are resolved with NSS, so local, winbind and sssd accounts all work, including named-user and named-group ACL entries and the ACL mask.
+- Everything else works as on Windows: checked before ranking, denied when in doubt, changes picked up at the next rescan.
+- Not covered: Samba-only rules in `smb.conf` (`valid users`, `read list`, `force user`…) and Windows ACLs stored by `vfs_acl_xattr` that aren't reflected in the POSIX ACLs. If you rely on those, use exclusions or check with `hound search --as`.
 
 To check what a specific user would see:
 
@@ -186,7 +243,7 @@ Excluded folders are neither indexed nor searchable, and anything already indexe
 DWG is a closed format. To read its content (text, title blocks, layers):
 
 1. Download and install **ODA File Converter**, free, from https://www.opendesign.com/guestfiles/oda_file_converter. The installer doesn't include it because its license must be accepted manually.
-2. Restart the service with `Restart-Service Hound`. Hound finds it under `C:\Program Files\ODA\` and automatically reprocesses the DWG files that were indexed by name only.
+2. Restart the service with `Restart-Service Hound` (Linux: `sudo systemctl restart hound`). Hound finds it under `C:\Program Files\ODA\` on Windows, or as `ODAFileConverter` in the `PATH` on Linux (the `.deb`/`.rpm` package installs it in `/usr/bin`), and automatically reprocesses the DWG files that were indexed by name only.
 
 If it's installed elsewhere, set the path in `[cad] oda_converter`.
 
@@ -194,7 +251,7 @@ If it's installed elsewhere, set the path in `[cad] oda_converter`.
 
 | Command | Purpose |
 |---|---|
-| `hound status` | Indexed, pending and failed files; last scan; whether the indexer is active |
+| `hound status` | Indexer phase, progress, pending and failed files, rate and estimated time left (same as the `index_status` tool) |
 | `hound errors` | Files that couldn't be read and why (password-protected PDF, damaged files…) |
 | `hound log --user maria` | Query log: who searched for what and when |
 | `hound doctor` | Checks folder, model, Tesseract, ODA and permissions |
@@ -202,29 +259,29 @@ If it's installed elsewhere, set the path in `[cad] oda_converter`.
 | `hound reindex --path "Projects\2024"` | Reindexes a folder or a file |
 | `hound reindex --all` | Rebuilds the whole index (e.g. after changing the model). Keeps tokens and the query log |
 | `hound backup D:\Backups` | Hot backup of the index |
-| `Restart-Service Hound` | Applies `config.toml` changes |
+| `Restart-Service Hound` / `sudo systemctl restart hound` | Applies `config.toml` changes |
 
-Logs are in `C:\ProgramData\Hound\logs`.
+Logs are in `C:\ProgramData\Hound\logs` on Windows, and in `/var/lib/hound/logs` and `journalctl -u hound` on Linux. On Linux, run these commands with `sudo`.
 
 ### Backup and restore
 
-The index (`C:\ProgramData\Hound\index.sqlite`) includes users, tokens and the query log. To back it up without stopping the service:
+The index (`C:\ProgramData\Hound\index.sqlite`, or `/var/lib/hound/index.sqlite` on Linux) includes users, tokens and the query log. To back it up without stopping the service:
 
 ```powershell
 hound backup D:\Backups
 ```
 
-You can schedule it with Task Scheduler. To restore:
+You can schedule it with Task Scheduler (on Linux, `sudo hound backup /backups` from cron or a systemd timer). To restore:
 
-1. `Stop-Service Hound`.
+1. `Stop-Service Hound` (Linux: `sudo systemctl stop hound`).
 2. Copy the file over `index.sqlite` and delete `index.sqlite-wal` and `index.sqlite-shm` if they exist.
-3. `Start-Service Hound`.
+3. `Start-Service Hound` (Linux: `sudo systemctl start hound`).
 
 If the index is lost, nothing in the shared folder is lost: just run `hound reindex --all` and create the tokens again.
 
 ## Configuration
 
-The file is `C:\ProgramData\Hound\config.toml`. After changing it, run `Restart-Service Hound`.
+The file is `C:\ProgramData\Hound\config.toml` on Windows and `/etc/hound/config.toml` on Linux. After changing it, run `Restart-Service Hound` or `sudo systemctl restart hound`.
 
 | Section | Option | Default | Description |
 |---|---|---|---|
@@ -268,7 +325,7 @@ About HTTPS: inside the VPN traffic is already encrypted. If you still want HTTP
   With 1 million fragments, the vector part takes about 120 ms.
 - **Incremental indexing:**
   - a periodic rescan compares each file's size, date and permissions;
-  - change monitoring (`ReadDirectoryChangesW`) reacts immediately;
+  - change monitoring (`ReadDirectoryChangesW` on Windows, inotify on Linux) reacts immediately;
   - extraction runs in separate processes with a per-file time limit, and a failing file is logged without stopping anything.
 
 ## Known limitations
@@ -276,6 +333,7 @@ About HTTPS: inside the VPN traffic is already encrypted. If you still want HTTP
 - Old `.doc` and `.ppt` files (binary format) are indexed by name only.
 - Images are searched by the text they contain (OCR), not by what they show. Photo search by content and audio are planned for a later phase.
 - Location labels and server messages are in Spanish.
+- Paths are compared case-insensitively, as on Windows. On Linux, two files in the same folder whose names differ only in case are indexed as one.
 
 ## Development
 
@@ -285,6 +343,7 @@ python -m pytest
 ```
 
 - The real-ACL permission tests (`tests/test_windows_acl.py`) create local users: they only run on Windows with `HOUND_WIN_ACL_TESTS=1`. GitHub CI runs them on `windows-latest`, together with a full installation using `install.ps1`.
+- The POSIX permission tests (`tests/test_posix_acl.py`) run on Linux and macOS; the one with real ACLs needs `setfacl`. CI also does a full installation on `ubuntu-latest` with `install.sh`, checks that a folder without permission stays hidden, and uninstalls.
 - `HOUND_BENCH=1` enables the performance test with 1 million fragments.
 
 The original brief (in Spanish) is in [docs/PROMPT.md](docs/PROMPT.md).

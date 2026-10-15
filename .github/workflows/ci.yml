@@ -52,6 +52,10 @@ jobs:
           $r = Invoke-RestMethod -Uri http://localhost:8765/mcp -Method Post -Headers $headers -Body $body -ContentType "application/json"
           $r | ConvertTo-Json -Depth 10
           if (($r | ConvertTo-Json -Depth 10) -notmatch "presupuesto.txt") { throw "La búsqueda no encontró el fichero" }
+          $body = '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"index_status","arguments":{}}}'
+          $r = Invoke-RestMethod -Uri http://localhost:8765/mcp -Method Post -Headers $headers -Body $body -ContentType "application/json"
+          $r | ConvertTo-Json -Depth 10
+          if (($r | ConvertTo-Json -Depth 10) -notmatch "progress_percent") { throw "index_status no respondió" }
       - name: Registros
         if: always()
         shell: powershell
@@ -59,3 +63,45 @@ jobs:
       - name: Desinstalar
         shell: powershell
         run: .\uninstall.ps1 -Purge
+
+  installer-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar con install.sh (desde el código del commit)
+        run: |
+          sudo mkdir -p /srv/compartido/Obras /srv/compartido/RRHH
+          echo "Presupuesto de la reforma de la cocina" | sudo tee /srv/compartido/Obras/presupuesto.txt
+          echo "Nomina de marzo de la reforma de personal" | sudo tee /srv/compartido/RRHH/nomina.txt
+          sudo chmod 700 /srv/compartido/RRHH
+          sudo ./install.sh --share /srv/compartido --source "$PWD" --allow-from 10.8.0.0/24
+      - name: Comprobar el servicio, el MCP y los permisos POSIX
+        run: |
+          systemctl is-active hound
+          mcp() {
+            curl -fsS http://127.0.0.1:8765/mcp -H "Authorization: Bearer $1" \
+              -H "Accept: application/json, text/event-stream" -H "MCP-Protocol-Version: 2025-06-18" \
+              -H "Content-Type: application/json" \
+              -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"$2\",\"arguments\":$3}}"
+          }
+          TOKEN=$(sudo hound token create "$USER" --label ci | grep -o 'hound_[A-Za-z0-9_-]*' | head -n 1)
+          for i in $(seq 1 30); do
+            out=$(mcp "$TOKEN" index_status '{}'); echo "$out"
+            echo "$out" | grep -q '\\"pending\\": 0' && echo "$out" | grep -q '\\"total\\": 2' && break
+            sleep 5
+          done
+          sleep 15  # el servidor recarga el índice cada 10 s
+          out=$(mcp "$TOKEN" search_files '{"query":"reforma"}'); echo "$out"
+          echo "$out" | grep -q presupuesto.txt || { echo "La búsqueda no encontró el fichero"; exit 1; }
+          # el usuario del runner no puede entrar en RRHH (700, de root): no debe ver la nómina
+          if echo "$out" | grep -q nomina; then echo "Se ha filtrado un fichero sin permiso"; exit 1; fi
+          sudo hound status
+          sudo hound doctor
+      - name: Registros
+        if: always()
+        run: sudo journalctl -u hound --no-pager -n 200
+      - name: Desinstalar
+        run: |
+          sudo ./uninstall.sh --purge
+          if systemctl is-active --quiet hound; then echo "El servicio sigue activo"; exit 1; fi
+          test ! -e /opt/hound && test ! -e /var/lib/hound && test ! -e /usr/local/bin/hound

@@ -98,7 +98,7 @@ class OcrConfig:
 @dataclass
 class CadConfig:
     oda_converter: str = ""
-    """Ruta a ODAFileConverter.exe para leer textos de ficheros DWG (opcional)."""
+    """Ruta a ODAFileConverter(.exe) para leer textos de ficheros DWG (opcional)."""
 
 
 @dataclass
@@ -124,8 +124,8 @@ class SearchConfig:
 
 @dataclass
 class PermissionsConfig:
-    mode: str = "ntfs"
-    """ntfs: filtra por las ACL de cada fichero; none: todos los usuarios ven todo."""
+    mode: str = "ntfs" if sys.platform == "win32" else "posix"
+    """ntfs (Windows) / posix (Linux): filtra por los permisos de cada fichero; none: todos ven todo."""
     cache_minutes: int = 10
 
 
@@ -181,6 +181,6 @@ def load_config(path: str | Path | None = None) -> Config:
         _merge(cfg, tomllib.loads(p.read_text(encoding="utf-8-sig")), "")
         cfg.config_path = str(p)
     cfg.index.extensions = [e.lower() if e.startswith(".") else "." + e.lower() for e in cfg.index.extensions]
-    if cfg.permissions.mode not in ("ntfs", "none"):
-        raise ValueError("permissions.mode debe ser 'ntfs' o 'none'")
+    if cfg.permissions.mode not in ("ntfs", "posix", "none"):
+        raise ValueError("permissions.mode debe ser 'ntfs', 'posix' o 'none'")
     return cfg

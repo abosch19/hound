@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Callable
 from typing import Any
 
 import anyio
@@ -15,14 +16,16 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
+from . import db
 from .auth import TokenStore
 from .search import AccessDenied, SearchIndex, User
+from .status import index_status
 
 log = logging.getLogger("hound.server")
 
 INSTRUCTIONS = """\
 Hound busca en los ficheros de la carpeta compartida de la empresa por significado y por palabras clave.
-Solo devuelve ficheros que el usuario puede abrir en el disco con sus permisos de Windows.
+Solo devuelve ficheros que el usuario puede abrir en el disco con sus permisos.
 
 - search_files: primero. Describe lo que buscas en lenguaje natural ("el contrato con el proveedor de
   limpieza", "factura de marzo de Pérez"). Filtra por carpeta, tipo (pdf, word, excel, powerpoint,
@@ -30,6 +33,8 @@ Solo devuelve ficheros que el usuario puede abrir en el disco con sus permisos d
 - read_document: lee el texto extraído de un fichero por tramos (start/end son índices de fragmento);
   usa next_start para seguir leyendo.
 - list_folder y recent_files: para explorar.
+- index_status: cómo va la indexación (progreso, pendientes, ritmo, tiempo estimado). Úsalo si una
+  búsqueda no encuentra algo que debería estar: puede que aún no se haya indexado.
 Las rutas se devuelven como rutas UNC que el usuario puede abrir en el Explorador de Windows.
 """
 
@@ -62,8 +67,27 @@ class BearerAuthMiddleware:
         await self.app(scope, receive, send)
 
 
-def build_mcp(index: SearchIndex, store: TokenStore) -> MCPServer:
+IndexSource = SearchIndex | Callable[[], SearchIndex | None]
+
+
+def build_mcp(index_source: IndexSource, store: TokenStore,
+              status_extra: Callable[[], dict] | None = None) -> MCPServer:
+    """`index_source` puede ser el índice o una función que lo devuelve (None mientras se carga):
+    así el servidor responde, al menos a index_status, desde el primer segundo."""
     mcp = MCPServer(name="hound", title="Hound: buscador de la carpeta compartida", instructions=INSTRUCTIONS)
+    get_index = index_source if callable(index_source) and not isinstance(index_source, SearchIndex) \
+        else (lambda: index_source)
+
+    class _Loading:
+        def __getattr__(self, _name):
+            raise ToolError("El índice de búsqueda se está cargando. Inténtalo en unos segundos "
+                            "(index_status muestra el progreso).")
+
+    class _Proxy:
+        def __getattr__(self, name):
+            return getattr(get_index() or _Loading(), name)
+
+    index = _Proxy()
 
     def current_user(ctx: Context) -> User:
         user = store.resolve(_bearer(ctx.headers))
@@ -138,11 +162,34 @@ def build_mcp(index: SearchIndex, store: TokenStore) -> MCPServer:
         return {"files": run(ctx, "recent_files", dict(limit=limit, folder=folder),
                              lambda u: index.recent_files(u, limit, folder))}
 
+    @mcp.tool(name="index_status")
+    def index_status_tool(ctx: Context) -> dict:
+        """Cómo va la indexación de la carpeta compartida.
+
+        Devuelve la fase del indexador (escaneando, indexando, en pausa, al día, parado), el progreso,
+        los ficheros pendientes y con error, el ritmo, el tiempo estimado para terminar y cuántos
+        ficheros puede ver el usuario. Solo recuentos: no incluye rutas.
+        """
+        def status(user: User) -> dict:
+            ix = get_index()
+            extra = dict(status_extra() if status_extra else {})
+            extra["search_index"] = "listo" if ix is not None else "cargando"
+            if ix is not None:
+                extra["files_visible_to_you"] = int(ix.user_mask(user).sum())
+            conn = db.connect(store.db_path, readonly=True)
+            try:
+                return index_status(conn, extra)
+            finally:
+                conn.close()
+
+        return run(ctx, "index_status", {}, status)
+
     return mcp
 
 
-def build_app(index: SearchIndex, store: TokenStore) -> BearerAuthMiddleware:
-    mcp = build_mcp(index, store)
+def build_app(index: IndexSource, store: TokenStore,
+              status_extra: Callable[[], dict] | None = None) -> BearerAuthMiddleware:
+    mcp = build_mcp(index, store, status_extra)
     mcp_app = mcp.streamable_http_app(stateless_http=True, json_response=True, host="0.0.0.0")
 
     async def health(_request: Request) -> JSONResponse:

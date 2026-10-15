@@ -47,8 +47,8 @@ def _fmt_ts(ts) -> str:
 # --- órdenes -----------------------------------------------------------------------
 
 CONFIG_TEMPLATE = """\
-# Configuración de Hound. Tras cambiarla: Restart-Service Hound
-
+# Configuración de Hound. Tras cambiarla: {restart}
+{data_dir_line}
 [share]
 # Ruta local de la carpeta compartida en este servidor
 path = '{share}'
@@ -61,8 +61,8 @@ name = '{share_name}'
 host = "0.0.0.0"
 port = {port}
 # Para HTTPS, rutas a certificado y clave PEM:
-# tls_cert = 'C:\\ProgramData\\Hound\\cert.pem'
-# tls_key = 'C:\\ProgramData\\Hound\\key.pem'
+# tls_cert = '{tls_example}cert.pem'
+# tls_key = '{tls_example}key.pem'
 
 [index]
 # Carpetas (relativas a la carpeta compartida) que no se indexan ni se pueden consultar,
@@ -86,10 +86,11 @@ languages = "spa+eng"
 [cad]
 # Para leer el contenido de los DWG instala ODA File Converter (gratuito) y, si no está en la
 # ruta por defecto, indica aquí el ejecutable:
-# oda_converter = 'C:\\Program Files\\ODA\\ODAFileConverter 26.4.0\\ODAFileConverter.exe'
+# oda_converter = '{oda_example}'
 
 [permissions]
-# "ntfs": cada usuario solo ve lo que puede abrir en el disco. "none": todos ven todo.
+# "ntfs" (Windows) o "posix" (Linux): cada usuario solo ve lo que puede abrir en el disco.
+# "none": todos ven todo.
 mode = "{perm_mode}"
 """
 
@@ -104,11 +105,19 @@ def cmd_init(args) -> int:
     if not unc and args.share_name:
         import socket
         unc = f"\\\\{socket.gethostname()}\\{args.share_name}"
+    from .security import default_mode
+
     tessdata = Path(args.tessdata) if args.tessdata else None
+    win = sys.platform == "win32"
     path.write_text(CONFIG_TEMPLATE.format(
         share=args.share, unc=unc or "", share_name=args.share_name or "", port=args.port,
+        restart="Restart-Service Hound" if win else "sudo systemctl restart hound",
+        data_dir_line=f"# Índice, modelo y registros\ndata_dir = '{args.data_dir}'\n" if args.data_dir else "",
+        tls_example="C:\\ProgramData\\Hound\\" if win else "/etc/hound/",
+        oda_example=("C:\\Program Files\\ODA\\ODAFileConverter 26.4.0\\ODAFileConverter.exe" if win
+                     else "/usr/bin/ODAFileConverter"),
         tessdata_line=f"tessdata = '{tessdata}'\n" if tessdata else "",
-        perm_mode="ntfs" if sys.platform == "win32" else "none",
+        perm_mode=args.permissions or default_mode(),
     ), encoding="utf-8")
     print(f"Configuración creada en {path}")
     return 0
@@ -131,7 +140,7 @@ def _make_indexer(cfg: Config):
     from .indexer import Indexer
     from .security import get_security
 
-    return Indexer(cfg, load_embedder(cfg.model, cfg.models_path), get_security(cfg.permissions.mode))
+    return Indexer(cfg, load_embedder(cfg.model, cfg.models_path), get_security(cfg.permissions.mode, cfg.share.path))
 
 
 def cmd_index(args, cfg: Config) -> int:
@@ -169,7 +178,7 @@ def _make_search(cfg: Config):
 
     if not cfg.db_path.exists():
         db.init_db(cfg.db_path).close()
-    return SearchIndex(cfg, load_embedder(cfg.model, cfg.models_path, threads=2), get_security(cfg.permissions.mode))
+    return SearchIndex(cfg, load_embedder(cfg.model, cfg.models_path, threads=2), get_security(cfg.permissions.mode, cfg.share.path))
 
 
 def cmd_serve(args, cfg: Config) -> int:
@@ -178,29 +187,62 @@ def cmd_serve(args, cfg: Config) -> int:
     return 0
 
 
-def serve(cfg: Config) -> None:
+def serve(cfg: Config, on_listening=None, status_extra=None) -> None:
+    """Servidor MCP. Escucha antes de cargar el índice de búsqueda (que puede tardar con muchos
+    ficheros): mientras tanto ya responde a index_status. `on_listening` se llama al abrir el puerto."""
     import uvicorn
 
     from .auth import TokenStore
     from .server import build_app
 
     db.init_db(cfg.db_path).close()
-    index = _make_search(cfg)
-    index.start_refresher()
-    app = build_app(index, TokenStore(cfg.db_path))
+    holder: dict = {"index": None}
+
+    def load_index():
+        t0 = time.monotonic()
+        while True:
+            try:
+                index = _make_search(cfg)
+                break
+            except Exception:
+                log.exception("No se pudo cargar el índice de búsqueda; se reintenta en 30 s")
+                time.sleep(30)
+        index.start_refresher()
+        holder["index"] = index
+        log.info("Índice de búsqueda cargado en %.0f s", time.monotonic() - t0)
+
+    app = build_app(lambda: holder["index"], TokenStore(cfg.db_path), status_extra)
     ssl = {}
     if cfg.server.tls_cert and cfg.server.tls_key:
         ssl = {"ssl_certfile": cfg.server.tls_cert, "ssl_keyfile": cfg.server.tls_key}
     scheme = "https" if ssl else "http"
-    log.info("Servidor MCP en %s://%s:%d/mcp", scheme, cfg.server.host, cfg.server.port)
-    uvicorn.run(app, host=cfg.server.host, port=cfg.server.port, log_config=None, **ssl)
+    server = uvicorn.Server(uvicorn.Config(app, host=cfg.server.host, port=cfg.server.port, log_config=None, **ssl))
+
+    def after_start():
+        while not server.started:
+            if server.should_exit:
+                return
+            time.sleep(0.1)
+        log.info("Servidor MCP en %s://%s:%d/mcp", scheme, cfg.server.host, cfg.server.port)
+        if on_listening:
+            on_listening()
+        load_index()
+
+    threading.Thread(target=after_start, name="hound-startup", daemon=True).start()
+    server.run()
 
 
 def _indexer_process(config_path: str, verbose: bool, parent_pid: int) -> None:
     import psutil
 
+    from .status import set_state
+
     cfg = load_config(config_path or None)
     setup_logging(cfg, "indexer", verbose)
+    conn = db.init_db(cfg.db_path)
+    set_state(conn, "starting")
+    conn.commit()
+    conn.close()
     stop = threading.Event()
 
     def watch_parent():  # si el servicio muere, el indexador no se queda huérfano
@@ -225,6 +267,7 @@ def cmd_run(args, cfg: Config) -> int:
     db.init_db(cfg.db_path).close()
     stop = threading.Event()
     ctx = mp.get_context("spawn")
+    sup = {"running": False, "restarts": 0, "last_exit_code": None, "next_restart": None}
 
     def supervise():
         delay = 5
@@ -234,23 +277,32 @@ def cmd_run(args, cfg: Config) -> int:
                             name="hound-indexer")
             started = time.monotonic()
             p.start()
+            sup.update(running=True, next_restart=None)
             while p.is_alive() and not stop.is_set():
                 p.join(1)
+            sup["running"] = False
             if stop.is_set():
                 p.terminate()
                 p.join(10)
                 return
-            log.error("El indexador terminó (código %s). Reinicio en %d s", p.exitcode, delay)
             delay = 5 if time.monotonic() - started > 600 else min(delay * 2, 600)
+            log.error("El indexador terminó (código %s). Reinicio en %d s", p.exitcode, delay)
+            sup.update(restarts=sup["restarts"] + 1, last_exit_code=p.exitcode,
+                       next_restart=dt.datetime.fromtimestamp(time.time() + delay).isoformat(timespec="seconds"))
             stop.wait(delay)
 
     t = threading.Thread(target=supervise, name="hound-supervisor", daemon=True)
-    t.start()
+
+    def status_extra() -> dict:
+        return {"indexer_process": {k: v for k, v in sup.items() if v is not None}}
+
+    # Primero el MCP; el indexador arranca cuando el puerto ya está abierto.
     try:
-        serve(cfg)
+        serve(cfg, on_listening=t.start, status_extra=status_extra)
     finally:
         stop.set()
-        t.join(15)
+        if t.is_alive():
+            t.join(15)
     return 0
 
 
@@ -260,7 +312,7 @@ def cmd_token(args, cfg: Config) -> int:
 
     conn = db.init_db(cfg.db_path)
     if args.action == "create":
-        name, token = create_token(conn, get_security(cfg.permissions.mode), args.account, args.label or "")
+        name, token = create_token(conn, get_security(cfg.permissions.mode, cfg.share.path), args.account, args.label or "")
         host = args.host or _guess_host()
         scheme = "https" if cfg.server.tls_cert else "http"
         print(f"Token creado para {name}. Guárdalo ahora: no se vuelve a mostrar.\n")
@@ -298,17 +350,15 @@ def cmd_status(args, cfg: Config) -> int:
     print(f"Índice: {cfg.db_path} ({cfg.db_path.stat().st_size / 1e6:.0f} MB)")
     print(f"Carpeta: {cfg.share.path}")
     print(f"Modelo: {db.get_meta(conn, 'model', '-')}")
-    for r in conn.execute("SELECT status, count(*) n FROM files GROUP BY status"):
-        print(f"  {r['status']:<8} {r['n']:>9} ficheros")
+    from .status import format_status, index_status
+
+    st = index_status(conn)
+    print(format_status(st))
     segs = conn.execute("SELECT max(id) FROM segments").fetchone()[0] or 0
-    print(f"  fragmentos ~{segs}")
-    print(f"Último escaneo completo: {_fmt_ts(db.get_meta(conn, 'last_full_scan'))}")
-    hb = db.get_meta(conn, "indexer_heartbeat")
-    alive = hb and time.time() - float(hb) < 600
-    print(f"Indexador: {'activo' if alive else 'sin actividad reciente'} (último latido {_fmt_ts(hb)})")
+    print(f"Fragmentos: ~{segs}")
     print("Por tipo:")
-    for r in conn.execute("SELECT kind, count(*) n FROM files GROUP BY kind ORDER BY n DESC"):
-        print(f"  {r['kind']:<11} {r['n']:>9}")
+    for kind, n in st["by_type"].items():
+        print(f"  {kind:<11} {n:>9}")
     return 0
 
 
@@ -388,7 +438,7 @@ def cmd_search(args, cfg: Config) -> int:
 
     index = _make_search(cfg)
     if args.as_user:
-        name, sid = get_security(cfg.permissions.mode).lookup_account(args.as_user)
+        name, sid = get_security(cfg.permissions.mode, cfg.share.path).lookup_account(args.as_user)
     else:
         name, sid = "admin", ""
         if index.security.enforced:
@@ -432,18 +482,19 @@ def cmd_doctor(args, cfg: Config) -> int:
          "Instálalo o desactiva [ocr] enabled")
     caps = capabilities(ExtractOptions(ocr=cfg.ocr, cad=cfg.cad))
     print(f"  INFO DWG: {'con ODA File Converter' if 'oda' in caps else 'solo por nombre (ODA File Converter no instalado)'}")
-    if cfg.permissions.mode == "ntfs":
+    if cfg.permissions.mode in ("ntfs", "posix"):
+        kind = cfg.permissions.mode.upper()
         try:
             from .security import get_security
 
-            sec = get_security("ntfs")
+            sec = get_security(cfg.permissions.mode, cfg.share.path)
             sd = sec.read_sd(cfg.share.path)
-            line(bool(sd), "Lectura de permisos NTFS")
-            if cfg.share.name:
+            line(bool(sd), f"Lectura de permisos {kind}")
+            if cfg.share.name and cfg.permissions.mode == "ntfs":
                 sec.share_sd(cfg.share.name)
                 line(True, f"Permisos del recurso compartido '{cfg.share.name}'")
         except Exception as exc:  # noqa: BLE001
-            line(False, f"Permisos NTFS: {exc}")
+            line(False, f"Permisos {kind}: {exc}")
     else:
         print("  AVISO permissions.mode = none: todos los usuarios con token ven todo el índice")
     return 0 if ok else 1
@@ -451,7 +502,7 @@ def cmd_doctor(args, cfg: Config) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="hound", description="Buscador semántico de la carpeta compartida (MCP)")
-    p.add_argument("--config", help="Ruta de config.toml (por defecto %%ProgramData%%\\Hound\\config.toml)")
+    p.add_argument("--config", help="Ruta de config.toml (por defecto la de HOUND_CONFIG)")
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--version", action="version", version=f"hound {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -462,6 +513,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--share-name", default="", help="Nombre del recurso compartido SMB")
     s.add_argument("--port", type=int, default=8765)
     s.add_argument("--tessdata", default="")
+    s.add_argument("--data-dir", default="", help="Carpeta del índice, el modelo y los registros")
+    s.add_argument("--permissions", choices=["ntfs", "posix", "none"], default="",
+                   help="Modo de permisos (por defecto ntfs en Windows y posix en Linux)")
     s.add_argument("--force", action="store_true")
 
     s = sub.add_parser("model", help="Descarga o comprueba el modelo de embeddings")
@@ -475,7 +529,7 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("token", help="Tokens personales del MCP")
     tsub = s.add_subparsers(dest="action", required=True)
-    t = tsub.add_parser("create", help="Crea un token para una cuenta de Windows")
+    t = tsub.add_parser("create", help="Crea un token para una cuenta del servidor o del dominio")
     t.add_argument("account", help="Cuenta: usuario, EQUIPO\\usuario o DOMINIO\\usuario")
     t.add_argument("--label", default="")
     t.add_argument("--host", default="", help="Nombre o IP del servidor en la VPN (para el comando de ejemplo)")
