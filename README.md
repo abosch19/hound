@@ -1,290 +1,294 @@
 # Hound
 
-Buscador semántico para la carpeta compartida de un Windows Server, consultable desde **Claude Code** por **MCP**.
+**English** · [Español](README.es.md) · [Català](README.ca.md)
 
-Hound indexa los ficheros de la carpeta compartida y permite encontrarlos por su significado ("el contrato con el proveedor de limpieza", "la factura de marzo de Pérez", "el presupuesto de la reforma"), no solo por su nombre. Funciona entero dentro del servidor:
+Semantic search for the shared folder on a Windows Server, queried from **Claude Code** over **MCP**.
 
-- **Nada sale del servidor al indexar.** El texto se extrae y los embeddings se calculan en local, en CPU.
-- **Cada búsqueda respeta los permisos de NTFS del usuario que pregunta.** Si alguien no puede abrir un fichero en el disco, tampoco ve su nombre ni ningún fragmento.
-- **Nunca modifica la carpeta compartida.** Solo la lee.
+Hound indexes the files in the shared folder so you can find them by meaning ("the contract with the cleaning supplier", "Pérez's March invoice", "the renovation quote"), not just by name. Everything runs on the server:
+
+- **Nothing leaves the server while indexing.** Text extraction and embeddings run locally, on the CPU.
+- **Every search respects the NTFS permissions of the person asking.** If someone can't open a file on disk, they don't see its name or any excerpt from it.
+- **It never modifies the shared folder.** It only reads it.
 
 ```
- Equipo del trabajador (VPN)                      Windows Server
+ Employee's computer (VPN)                        Windows Server
 ┌────────────────────────┐   HTTP + token   ┌──────────────────────────────────────────┐
-│ Claude Code            │ ───────────────► │ Servicio "Hound"                          │
-│  └─ MCP "hound"        │     /mcp         │  ├─ Servidor MCP (búsqueda + permisos)    │
-└────────────────────────┘                  │  └─ Indexador (prioridad baja)            │
-                                            │        │ lee            │ escribe          │
-                                            │   D:\Compartido    índice SQLite          │
+│ Claude Code            │ ───────────────► │ "Hound" service                           │
+│  └─ MCP "hound"        │     /mcp         │  ├─ MCP server (search + permissions)     │
+└────────────────────────┘                  │  └─ Indexer (low priority)                │
+                                            │        │ reads          │ writes           │
+                                            │   D:\Shared        SQLite index           │
                                             └──────────────────────────────────────────┘
 ```
 
-## Qué indexa
+## What it indexes
 
-| Tipo | Extensiones | Qué se extrae |
+| Type | Extensions | What is extracted |
 |---|---|---|
-| PDF | `.pdf` | Texto por página; **OCR** de las páginas escaneadas |
-| Imágenes | `.jpg .png .tif .bmp .webp` | Texto por **OCR** (documentos fotografiados, escaneos, rótulos) |
-| AutoCAD | `.dxf`, `.dwg` | Textos, atributos de bloques (cajetines), cotas y capas. Los DWG necesitan [ODA File Converter](#ficheros-dwg-de-autocad); sin él se indexan por nombre |
-| Word | `.docx .docm .odt .rtf` | Párrafos, tablas, encabezados |
-| Excel | `.xlsx .xlsm .xls .ods .csv` | Filas por hoja, con la cabecera como contexto |
-| PowerPoint | `.pptx .pptm .odp` | Texto y notas por diapositiva |
-| Correo | `.msg .eml` | Cabecera, cuerpo y **adjuntos** (PDF, Word, Excel…) |
-| Texto | `.txt .md .log` | Párrafos |
-| Otros | `.doc .ppt .zip .mp4`… | Solo nombre y carpeta |
+| PDF | `.pdf` | Text per page; **OCR** of scanned pages |
+| Images | `.jpg .png .tif .bmp .webp` | Text via **OCR** (photographed documents, scans, signs) |
+| AutoCAD | `.dxf`, `.dwg` | Text, block attributes (title blocks), dimensions and layers. DWG files need [ODA File Converter](#autocad-dwg-files); without it they are indexed by name |
+| Word | `.docx .docm .odt .rtf` | Paragraphs, tables, headers |
+| Excel | `.xlsx .xlsm .xls .ods .csv` | Rows per sheet, with the header row as context |
+| PowerPoint | `.pptx .pptm .odp` | Text and notes per slide |
+| Email | `.msg .eml` | Header, body and **attachments** (PDF, Word, Excel…) |
+| Text | `.txt .md .log` | Paragraphs |
+| Other | `.doc .ppt .zip .mp4`… | Name and folder only |
 
-**Todos** los ficheros se pueden encontrar también por su nombre y su carpeta, incluso cuando no se puede leer su contenido.
+**Every** file can also be found by its name and folder, even when its content can't be read.
 
-Cada resultado indica **dónde** está la coincidencia: "página 3", "hoja Gastos, filas 2–40", "diapositiva 5", "adjunto factura.pdf, página 1", "bloque CAJETIN"…
+Each result says **where** the match is: "página 3" (page 3), "hoja Gastos, filas 2–40" (sheet, rows), "diapositiva 5" (slide), "adjunto factura.pdf, página 1" (attachment), "bloque CAJETIN" (block)… Location labels are currently in Spanish.
 
-## Requisitos
+## Requirements
 
-- Windows Server 2016 o posterior, de 64 bits, con acceso a internet durante la instalación.
-- Unos 2 GB de disco para el programa y el modelo, más el índice: unos 4–5 KB por fragmento. Con 1 millón de fragmentos son unos 5 GB.
-- RAM para los vectores en memoria: unos 3 KB por fragmento. Con 1 millón son unos 3 GB, o la mitad con `memory_dtype = "float16"`.
-- No necesita GPU.
+- Windows Server 2016 or later, 64-bit, with internet access during installation.
+- About 2 GB of disk for the program and the model, plus the index: about 4–5 KB per fragment. With 1 million fragments that's about 5 GB.
+- RAM for the in-memory vectors: about 3 KB per fragment. With 1 million that's about 3 GB, or half with `memory_dtype = "float16"`.
+- No GPU needed.
 
-## Instalación
+## Installation
 
-En el servidor, abre **PowerShell como administrador** y ejecuta:
+On the server, open **PowerShell as administrator** and run:
 
 ```powershell
 irm https://raw.githubusercontent.com/abosch19/hound/main/install.ps1 | iex
 ```
 
-Si el servidor solo tiene un recurso compartido, lo detecta solo; si tiene varios, pregunta cuál. Para indicar los parámetros, sobre todo la **red de la VPN** que podrá conectarse:
+If the server has a single shared folder, it is detected automatically; if it has several, you are asked which one. To pass parameters, especially the **VPN network** allowed to connect:
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/abosch19/hound/main/install.ps1))) -SharePath D:\Compartido -AllowFrom 10.8.0.0/24
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/abosch19/hound/main/install.ps1))) -SharePath D:\Shared -AllowFrom 10.8.0.0/24
 ```
 
-Si prefieres descargarlo primero con `curl`:
+If you'd rather download it first with `curl`:
 
 ```powershell
 curl.exe -fsSL https://raw.githubusercontent.com/abosch19/hound/main/install.ps1 -o install.ps1
-powershell -ExecutionPolicy Bypass -File .\install.ps1 -SharePath D:\Compartido -AllowFrom 10.8.0.0/24
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -SharePath D:\Shared -AllowFrom 10.8.0.0/24
 ```
 
-| Parámetro | Por defecto | Qué es |
+| Parameter | Default | Meaning |
 |---|---|---|
-| `-SharePath` | se detecta | Ruta local de la carpeta compartida |
-| `-AllowFrom` | subred local | Red(es) que pueden conectar al MCP, p. ej. la de la VPN. Separadas por comas |
-| `-Port` | `8765` | Puerto del MCP |
-| `-ShareName` / `-Unc` | se detectan | Nombre del recurso SMB y ruta `\\SERVIDOR\Recurso` que se muestra en los resultados |
-| `-OcrLanguages` | `spa,eng` | Idiomas de OCR (p. ej. `spa,eng,cat`) |
-| `-Version` | `main` | Rama o etiqueta de GitHub |
-| `-NoOcr` | | No instala Tesseract |
+| `-SharePath` | detected | Local path of the shared folder |
+| `-AllowFrom` | local subnet | Network(s) allowed to reach the MCP, e.g. the VPN's. Comma-separated |
+| `-Port` | `8765` | MCP port |
+| `-ShareName` / `-Unc` | detected | SMB share name and the `\\SERVER\Share` path shown in results |
+| `-OcrLanguages` | `spa,eng` | OCR languages (e.g. `spa,eng,cat`) |
+| `-Version` | `main` | GitHub branch or tag |
+| `-NoOcr` | | Don't install Tesseract |
 
-El instalador hace lo siguiente:
+The installer does the following:
 
-1. Instala `uv` y un Python 3.12 propio en `C:\Program Files\Hound`, sin tocar el Python del sistema.
-2. Instala Hound y sus dependencias.
-3. Instala Tesseract con los idiomas de OCR.
-4. Descarga el modelo de embeddings, una sola vez.
-5. Crea `C:\ProgramData\Hound\config.toml`.
-6. Registra el servicio **Hound**: arranque automático y reinicio si falla.
-7. Abre el puerto en el firewall solo para `-AllowFrom`.
+1. Installs `uv` and its own Python 3.12 in `C:\Program Files\Hound`, without touching the system Python.
+2. Installs Hound and its dependencies.
+3. Installs Tesseract with the OCR languages.
+4. Downloads the embedding model, once.
+5. Creates `C:\ProgramData\Hound\config.toml`.
+6. Registers the **Hound** service: starts automatically and restarts if it fails.
+7. Enables long path support in Windows (`LongPathsEnabled`).
+8. Opens the port in the firewall only for `-AllowFrom`.
 
-Al terminar, el índice empieza a construirse en segundo plano. Para ver el progreso:
+When it finishes, the index starts building in the background. To follow progress:
 
 ```powershell
 hound status
 ```
 
-> **Indexación inicial.** Con muchos ficheros (sobre todo PDFs escaneados e imágenes con OCR), la primera indexación puede durar horas o días. En horario laboral el indexador va despacio, con prioridad baja de CPU y disco. Si prefieres que solo trabaje de noche, pon `busy_mode = "pause"` en `config.toml`. Después solo procesa los cambios.
+> **Initial indexing.** With many files (especially scanned PDFs and images that need OCR), the first indexing run can take hours or days. During working hours the indexer runs slowly, with low CPU and disk priority. If you'd rather it only work at night, set `busy_mode = "pause"` in `config.toml`. After that it only processes changes.
 
-### Actualizar
+### Updating
 
-Vuelve a ejecutar el mismo comando de instalación. Se conservan la configuración, el índice y los tokens.
+Run the same installation command again. Configuration, index and tokens are kept.
 
-### Desinstalar
+### Uninstalling
 
 ```powershell
 irm https://raw.githubusercontent.com/abosch19/hound/main/uninstall.ps1 | iex
 ```
 
-Conserva los datos en `C:\ProgramData\Hound`. Para borrarlos también:
+Data in `C:\ProgramData\Hound` is kept. To delete it too:
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/abosch19/hound/main/uninstall.ps1))) -Purge
 ```
 
-## Añadir un usuario y conectar Claude Code
+## Adding a user and connecting Claude Code
 
-Cada trabajador usa un **token personal** asociado a **su cuenta de Windows**. Las búsquedas se hacen con los permisos de esa cuenta. En el servidor, como administrador:
+Each employee uses a **personal token** tied to **their Windows account**. Searches run with that account's permissions. On the server, as administrator:
 
 ```powershell
-hound token create maria --host SERVIDOR
+hound token create maria --host SERVER
 ```
 
-La cuenta puede ser `maria`, `EQUIPO\maria` o `DOMINIO\maria`: local si el servidor es un grupo de trabajo, o del dominio si hay Active Directory. La orden muestra el token **una sola vez** y el comando exacto que la persona debe ejecutar en su ordenador, con la VPN conectada:
+The account can be `maria`, `COMPUTER\maria` or `DOMAIN\maria`: local if the server is in a workgroup, or a domain account if you use Active Directory. The command shows the token **only once**, together with the exact command the person must run on their computer, with the VPN connected:
 
 ```bash
-claude mcp add --transport http --scope user hound http://SERVIDOR:8765/mcp --header "Authorization: Bearer hound_..."
+claude mcp add --transport http --scope user hound http://SERVER:8765/mcp --header "Authorization: Bearer hound_..."
 ```
 
-Después, en Claude Code basta con pedir cosas como *"busca en la carpeta compartida el contrato con el proveedor de limpieza y dime cuándo vence"*.
+From then on, in Claude Code it's enough to ask things like *"search the shared folder for the contract with the cleaning supplier and tell me when it expires"*.
 
-Hound expone estas herramientas:
+Hound exposes these tools:
 
-| Herramienta | Qué hace |
+| Tool | What it does |
 |---|---|
-| `search_files(query, folder?, file_type?, date_from?, date_to?, limit?)` | Búsqueda híbrida. Devuelve ruta UNC, ubicación, fragmento resaltado, fecha y puntuación |
-| `read_document(path, start?, end?)` | Texto extraído del fichero por tramos, sin cargarlo entero |
-| `list_folder(path?)` | Subcarpetas y ficheros visibles para el usuario |
-| `recent_files(limit?, folder?)` | Últimos ficheros modificados |
+| `search_files(query, folder?, file_type?, date_from?, date_to?, limit?)` | Hybrid search. Returns UNC path, location, highlighted excerpt, date and score |
+| `read_document(path, start?, end?)` | Extracted text of a file, in chunks, without loading all of it |
+| `list_folder(path?)` | Subfolders and files visible to the user |
+| `recent_files(limit?, folder?)` | Most recently modified files |
 
-Otras órdenes para gestionar los tokens:
+Other commands to manage tokens:
 
 ```powershell
 hound token list
-hound token revoke maria   # todos los tokens de maria
-hound token revoke 7       # solo el token con id 7
+hound token revoke maria   # all of maria's tokens
+hound token revoke 7       # only the token with id 7
 ```
 
-Un token revocado deja de funcionar en menos de 30 segundos.
+A revoked token stops working within 30 seconds.
 
-> **Por qué Claude Code y no los conectores de claude.ai.** Los conectores remotos de claude.ai se llaman desde los servidores de Anthropic, que no pueden llegar a un servidor que solo es accesible por VPN. Claude Code se conecta desde el ordenador del usuario, que sí está en la VPN. Hound no debe exponerse a internet.
+> **Why Claude Code and not claude.ai connectors.** Remote connectors on claude.ai are called from Anthropic's servers, which can't reach a server that is only reachable over VPN. Claude Code connects from the user's computer, which is on the VPN. Hound must not be exposed to the internet.
 
-## Permisos
+## Permissions
 
-- Al indexar, Hound guarda el descriptor de seguridad NTFS de cada fichero: propietario, grupo y ACL.
-- Al buscar, comprueba con la API **Authz** de Windows si la cuenta del token puede leer cada fichero. Tiene en cuenta grupos, grupos anidados, herencia y permisos de "Denegar", igual que el propio Windows.
-- La comprobación se hace **antes** de ordenar los resultados, así que un fichero sin permiso nunca aparece: ni en búsquedas, ni en `read_document`, ni en `list_folder`, ni en `recent_files`.
-- Si `share.name` está configurado, se aplican también los permisos del recurso compartido (pestaña "Compartir").
-- Ante cualquier duda (fichero sin descriptor, error de Windows) el acceso se **deniega**.
-- Los cambios de permisos en el disco se aplican en el siguiente reescaneo: enseguida si los detecta la vigilancia de cambios y, como mucho, cada `rescan_minutes`.
+- When indexing, Hound stores each file's NTFS security descriptor: owner, group and ACL.
+- When searching, it uses the Windows **Authz** API to check whether the token's account can read each file. It accounts for groups, nested groups, inheritance and "Deny" entries, just like Windows itself.
+- The check happens **before** results are ranked, so a file the user can't access never appears: not in searches, `read_document`, `list_folder` or `recent_files`.
+- If `share.name` is set, the share permissions ("Sharing" tab) are applied as well.
+- When in doubt (a file without a descriptor, a Windows error), access is **denied**.
+- Permission changes on disk take effect at the next rescan: right away if change monitoring picks them up and, at most, every `rescan_minutes`.
 
-Otros puntos a tener en cuenta:
+Other things to keep in mind:
 
-- **Cuenta del servicio.** El servicio corre como `SYSTEM`, que debe poder leer la carpeta compartida (es lo habitual). `hound doctor` lo comprueba.
-- **Servidor en dominio.** Para calcular los grupos de un usuario del dominio, la cuenta de equipo del servidor debe poder leer el atributo `tokenGroupsGlobalAndUniversal`. Normalmente ya puede; si `hound search --as DOMINIO\usuario` falla, añade el equipo al grupo **Windows Authorization Access Group** del dominio.
-- **Modo sin permisos.** Con `permissions.mode = "none"` todos los usuarios con token ven todo el índice. Úsalo solo si de verdad todo el mundo puede ver todo.
+- **Service account.** The service runs as `SYSTEM`, which must be able to read the shared folder (it usually can). `hound doctor` checks this.
+- **Domain-joined server.** To compute a domain user's groups, the server's computer account must be able to read the `tokenGroupsGlobalAndUniversal` attribute. It usually can; if `hound search --as DOMAIN\user` fails, add the computer to the domain's **Windows Authorization Access Group**.
+- **No-permissions mode.** With `permissions.mode = "none"` every user with a token sees the whole index. Only use it if everyone really can see everything.
 
-Para comprobar qué vería un usuario concreto:
+To check what a specific user would see:
 
 ```powershell
-hound search "nóminas de marzo" --as maria
+hound search "March payslips" --as maria
 ```
 
-## Carpetas excluidas
+## Excluded folders
 
-Lo que Claude lee con estas herramientas se envía a Anthropic para generar la respuesta. Por eso, las carpetas que no deben salir del servidor (nóminas, RR. HH., datos de salud…) se excluyen del índice en `config.toml`:
+Whatever Claude reads through these tools is sent to Anthropic to generate the answer. That's why folders that must not leave the server (payroll, HR, health data…) are excluded from the index in `config.toml`:
 
 ```toml
 [index]
-exclude = ["RRHH", "Administracion/Nominas"]
+exclude = ["HR", "Accounting/Payroll"]
 ```
 
-Lo excluido no se indexa ni se puede consultar, y lo que ya estuviera indexado se borra del índice en el siguiente escaneo. Las rutas son relativas a la carpeta compartida y no distinguen mayúsculas.
+Excluded folders are neither indexed nor searchable, and anything already indexed under them is removed at the next scan. Paths are relative to the shared folder and case-insensitive.
 
-## Ficheros DWG de AutoCAD
+## AutoCAD DWG files
 
-DWG es un formato cerrado. Para leer su contenido (textos, cajetines, capas):
+DWG is a closed format. To read its content (text, title blocks, layers):
 
-1. Descarga e instala **ODA File Converter**, gratuito, desde https://www.opendesign.com/guestfiles/oda_file_converter. No lo incluye el instalador porque su licencia exige aceptarla.
-2. Reinicia el servicio con `Restart-Service Hound`. Hound lo detecta en `C:\Program Files\ODA\` y reprocesa automáticamente los DWG que antes se indexaron solo por nombre.
+1. Download and install **ODA File Converter**, free, from https://www.opendesign.com/guestfiles/oda_file_converter. The installer doesn't include it because its license must be accepted manually.
+2. Restart the service with `Restart-Service Hound`. Hound finds it under `C:\Program Files\ODA\` and automatically reprocesses the DWG files that were indexed by name only.
 
-Si está en otra ruta, indícala en `[cad] oda_converter`.
+If it's installed elsewhere, set the path in `[cad] oda_converter`.
 
-## Operación
+## Operations
 
-| Orden | Para qué |
+| Command | Purpose |
 |---|---|
-| `hound status` | Ficheros indexados, pendientes y con error; último escaneo; si el indexador está activo |
-| `hound errors` | Ficheros que no se pudieron leer y por qué (PDF con contraseña, ficheros dañados…) |
-| `hound log --user maria` | Registro de consultas: quién buscó qué y cuándo |
-| `hound doctor` | Comprueba carpeta, modelo, Tesseract, ODA y permisos |
-| `hound reindex --errors` | Reintenta los ficheros con error |
-| `hound reindex --path "Obras\2024"` | Reindexa una carpeta o un fichero |
-| `hound reindex --all` | Rehace el índice entero (p. ej. tras cambiar de modelo). Conserva tokens y registro |
-| `hound backup D:\Copias` | Copia de seguridad en caliente del índice |
-| `Restart-Service Hound` | Aplica cambios de `config.toml` |
+| `hound status` | Indexed, pending and failed files; last scan; whether the indexer is active |
+| `hound errors` | Files that couldn't be read and why (password-protected PDF, damaged files…) |
+| `hound log --user maria` | Query log: who searched for what and when |
+| `hound doctor` | Checks folder, model, Tesseract, ODA and permissions |
+| `hound reindex --errors` | Retries failed files |
+| `hound reindex --path "Projects\2024"` | Reindexes a folder or a file |
+| `hound reindex --all` | Rebuilds the whole index (e.g. after changing the model). Keeps tokens and the query log |
+| `hound backup D:\Backups` | Hot backup of the index |
+| `Restart-Service Hound` | Applies `config.toml` changes |
 
-Los registros están en `C:\ProgramData\Hound\logs`.
+Logs are in `C:\ProgramData\Hound\logs`.
 
-### Copia de seguridad y restauración
+### Backup and restore
 
-El índice (`C:\ProgramData\Hound\index.sqlite`) incluye los usuarios, los tokens y el registro de consultas. Para hacer la copia sin parar el servicio:
+The index (`C:\ProgramData\Hound\index.sqlite`) includes users, tokens and the query log. To back it up without stopping the service:
 
 ```powershell
-hound backup D:\Copias
+hound backup D:\Backups
 ```
 
-Puedes programarla con el Programador de tareas. Para restaurar:
+You can schedule it with Task Scheduler. To restore:
 
 1. `Stop-Service Hound`.
-2. Copia el fichero encima de `index.sqlite` y borra `index.sqlite-wal` e `index.sqlite-shm` si existen.
+2. Copy the file over `index.sqlite` and delete `index.sqlite-wal` and `index.sqlite-shm` if they exist.
 3. `Start-Service Hound`.
 
-Si se pierde el índice, no se pierde nada de la carpeta compartida: basta con `hound reindex --all` y volver a crear los tokens.
+If the index is lost, nothing in the shared folder is lost: just run `hound reindex --all` and create the tokens again.
 
-## Configuración
+## Configuration
 
-El fichero es `C:\ProgramData\Hound\config.toml`. Tras cambiarlo, ejecuta `Restart-Service Hound`.
+The file is `C:\ProgramData\Hound\config.toml`. After changing it, run `Restart-Service Hound`.
 
-| Sección | Opción | Por defecto | Descripción |
+| Section | Option | Default | Description |
 |---|---|---|---|
-| `share` | `path` | | Ruta local de la carpeta compartida |
-| | `unc` | | Ruta UNC que se muestra en los resultados |
-| | `name` | | Recurso SMB cuyos permisos se aplican también |
-| `server` | `host`, `port` | `0.0.0.0`, `8765` | Dónde escucha el MCP |
-| | `tls_cert`, `tls_key` | | Rutas PEM para servir HTTPS |
-| `index` | `exclude` | `[]` | Carpetas excluidas |
-| | `exclude_names` | papelera, `~$*`, `Thumbs.db`… | Nombres ignorados (glob) |
-| | `extensions` | ver arriba | Extensiones que se indexan |
-| | `max_file_mb` | `300` | Por encima, solo por nombre |
-| | `rescan_minutes` | `360` | Reescaneo completo periódico |
-| | `watch` | `true` | Vigilancia de cambios en tiempo real |
-| | `extract_workers` | `2` | Procesos de extracción en paralelo |
-| `index.schedule` | `busy_hours`, `busy_days` | `08:00-19:00`, `mon-fri` | Horario laboral |
-| | `busy_mode` | `slow` | `slow`, `pause` o `normal` |
-| `ocr` | `enabled`, `languages`, `dpi` | `true`, `spa+eng`, `300` | OCR con Tesseract |
-| `cad` | `oda_converter` | se detecta | Ruta a `ODAFileConverter.exe` |
-| `model` | `repo`, `file`, `dim` | EmbeddingGemma-300M int8, 768 | Modelo de embeddings ONNX |
-| | `threads` | la mitad de los núcleos | Hilos de CPU para los embeddings |
-| `search` | `memory_dtype` | `float32` | `float16` usa la mitad de RAM y es algo más lento |
-| `permissions` | `mode` | `ntfs` | `ntfs` o `none` |
+| `share` | `path` | | Local path of the shared folder |
+| | `unc` | | UNC path shown in results |
+| | `name` | | SMB share whose permissions are applied as well |
+| `server` | `host`, `port` | `0.0.0.0`, `8765` | Where the MCP listens |
+| | `tls_cert`, `tls_key` | | PEM paths to serve HTTPS |
+| `index` | `exclude` | `[]` | Excluded folders |
+| | `exclude_names` | recycle bin, `~$*`, `Thumbs.db`… | Ignored names (glob) |
+| | `extensions` | see above | Extensions to index |
+| | `max_file_mb` | `300` | Above this size, name only |
+| | `rescan_minutes` | `360` | Periodic full rescan |
+| | `watch` | `true` | Real-time change monitoring |
+| | `extract_workers` | `2` | Parallel extraction processes |
+| `index.schedule` | `busy_hours`, `busy_days` | `08:00-19:00`, `mon-fri` | Working hours |
+| | `busy_mode` | `slow` | `slow`, `pause` or `normal` |
+| `ocr` | `enabled`, `languages`, `dpi` | `true`, `spa+eng`, `300` | OCR with Tesseract |
+| `cad` | `oda_converter` | detected | Path to `ODAFileConverter.exe` |
+| `model` | `repo`, `file`, `dim` | EmbeddingGemma-300M int8, 768 | ONNX embedding model |
+| | `threads` | half the cores | CPU threads for embeddings |
+| `search` | `memory_dtype` | `float32` | `float16` uses half the RAM and is somewhat slower |
+| `permissions` | `mode` | `ntfs` | `ntfs` or `none` |
 
-Sobre HTTPS: dentro de la VPN el tráfico ya va cifrado. Si aun así quieres usar HTTPS con un certificado propio, los usuarios deben configurar `NODE_EXTRA_CA_CERTS` con la CA para que Claude Code lo acepte.
+About HTTPS: inside the VPN traffic is already encrypted. If you still want HTTPS with your own certificate, users must set `NODE_EXTRA_CA_CERTS` to the CA so Claude Code accepts it.
 
-## Cómo funciona
+## How it works
 
-- **Índice:** un único SQLite en modo WAL, al estilo de [DigUp](https://github.com/ARahim3/DigUp). El indexador es el único que escribe; el servidor solo lee. Tablas:
-  - `files`: ruta, tipo, tamaño, fecha, estado y descriptor de seguridad;
-  - `segments`: fragmentos con su ubicación, el texto y el vector en float16;
-  - `segments_fts`: índice de palabras clave FTS5, sin tildes;
-  - `security_descriptors`: deduplicados, porque casi todos los ficheros heredan los permisos de su carpeta;
-  - `users`, `tokens` y `query_log`.
-- **Modelo:** [EmbeddingGemma-300M](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX), cuantizado int8, con ONNX Runtime en CPU. Es multilingüe, con buena calidad en español, y dos veces más ligero que bge-m3. Se descarga una vez y funciona sin conexión.
-- **Búsqueda híbrida:**
-  1. Similitud coseno contra todos los vectores en memoria (numpy, por bloques).
-  2. En paralelo, FTS5 con BM25 para las palabras clave.
-  3. Las dos listas se combinan con *Reciprocal Rank Fusion* y se agrupan por fichero.
+- **Index:** a single SQLite database in WAL mode, in the style of [DigUp](https://github.com/ARahim3/DigUp). The indexer is the only writer; the server only reads. Tables:
+  - `files`: path, type, size, date, status and security descriptor;
+  - `segments`: fragments with their location, text and float16 vector;
+  - `segments_fts`: FTS5 keyword index, accent-insensitive;
+  - `security_descriptors`: deduplicated, because most files inherit their folder's permissions;
+  - `users`, `tokens` and `query_log`.
+- **Model:** [EmbeddingGemma-300M](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX), int8-quantized, with ONNX Runtime on the CPU. It's multilingual, with good quality in Spanish, and half the size of bge-m3. It's downloaded once and then works offline.
+- **Hybrid search:**
+  1. Cosine similarity against all vectors in memory (numpy, in blocks).
+  2. In parallel, FTS5 with BM25 for keywords.
+  3. Both lists are combined with *Reciprocal Rank Fusion* and grouped by file.
 
-  Con 1 millón de fragmentos, la parte vectorial tarda unos 120 ms.
-- **Indexado incremental:**
-  - un reescaneo periódico compara el tamaño, la fecha y los permisos de cada fichero;
-  - la vigilancia de cambios (`ReadDirectoryChangesW`) reacciona al momento;
-  - la extracción corre en procesos aparte con tiempo máximo por fichero, y un fichero que falla se registra y no detiene nada.
+  With 1 million fragments, the vector part takes about 120 ms.
+- **Incremental indexing:**
+  - a periodic rescan compares each file's size, date and permissions;
+  - change monitoring (`ReadDirectoryChangesW`) reacts immediately;
+  - extraction runs in separate processes with a per-file time limit, and a failing file is logged without stopping anything.
 
-## Limitaciones conocidas
+## Known limitations
 
-- `.doc` y `.ppt` antiguos (formato binario) se indexan solo por nombre.
-- Las imágenes se buscan por el texto que contienen (OCR), no por lo que muestran. La búsqueda de fotos por contenido y el audio quedan para una fase posterior.
+- Old `.doc` and `.ppt` files (binary format) are indexed by name only.
+- Images are searched by the text they contain (OCR), not by what they show. Photo search by content and audio are planned for a later phase.
+- Location labels and server messages are in Spanish.
 
-## Desarrollo
+## Development
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
 python -m pytest
 ```
 
-- Los tests de permisos con ACL reales (`tests/test_windows_acl.py`) crean usuarios locales: solo se ejecutan en Windows con `HOUND_WIN_ACL_TESTS=1`. La CI de GitHub lo hace en `windows-latest`, junto con una instalación completa con `install.ps1`.
-- `HOUND_BENCH=1` activa la prueba de rendimiento con 1 millón de fragmentos.
+- The real-ACL permission tests (`tests/test_windows_acl.py`) create local users: they only run on Windows with `HOUND_WIN_ACL_TESTS=1`. GitHub CI runs them on `windows-latest`, together with a full installation using `install.ps1`.
+- `HOUND_BENCH=1` enables the performance test with 1 million fragments.
 
-El encargo original está en [docs/PROMPT.md](docs/PROMPT.md).
+The original brief (in Spanish) is in [docs/PROMPT.md](docs/PROMPT.md).
 
-## Licencia
+## License
 
 MIT

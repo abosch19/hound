@@ -177,8 +177,8 @@ def load_config(path: str | Path | None = None) -> Config:
     cfg = Config()
     p = Path(path) if path else default_config_path()
     if p.exists():
-        with open(p, "rb") as fh:
-            _merge(cfg, tomllib.load(fh), "")
+        # utf-8-sig: el Bloc de notas y PowerShell 5 suelen guardar con BOM, que tomllib no acepta.
+        _merge(cfg, tomllib.loads(p.read_text(encoding="utf-8-sig")), "")
         cfg.config_path = str(p)
     cfg.index.extensions = [e.lower() if e.startswith(".") else "." + e.lower() for e in cfg.index.extensions]
     if cfg.permissions.mode not in ("ntfs", "none"):

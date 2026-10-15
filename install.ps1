@@ -190,8 +190,8 @@ if (-not (Test-Path $config)) {
     & $hound @initArgs
     if ($LASTEXITCODE) { throw "No se pudo crear la configuracion" }
     if (-not $NoOcr) {
-        (Get-Content $config -Raw) -replace 'languages = "spa\+eng"', ('languages = "' + ($OcrLanguages -join "+") + '"') |
-            Set-Content $config -Encoding UTF8
+        $text = (Get-Content $config -Raw -Encoding UTF8) -replace 'languages = "spa\+eng"', ('languages = "' + ($OcrLanguages -join "+") + '"')
+        [IO.File]::WriteAllText($config, $text, (New-Object Text.UTF8Encoding $false))   # sin BOM
     }
 } else {
     Info "Se conserva la configuracion existente: $config"

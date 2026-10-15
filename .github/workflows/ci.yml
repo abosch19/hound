@@ -17,6 +17,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
+          activate-environment: true
       - name: Tesseract (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y tesseract-ocr tesseract-ocr-spa
