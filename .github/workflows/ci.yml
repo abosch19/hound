@@ -62,7 +62,11 @@ jobs:
         run: Get-ChildItem "$env:ProgramData\Hound\logs" | ForEach-Object { "== $_"; Get-Content $_.FullName -Tail 80 }
       - name: Desinstalar
         shell: powershell
-        run: .\uninstall.ps1 -Purge
+        run: |
+          $t = Measure-Command { Stop-Service Hound }
+          "Parada del servicio: $([int]$t.TotalSeconds) s"
+          if ($t.TotalSeconds -gt 15) { throw "El servicio tarda demasiado en pararse" }
+          .\uninstall.ps1 -Purge
 
   installer-linux:
     runs-on: ubuntu-latest

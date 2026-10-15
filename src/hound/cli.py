@@ -187,7 +187,7 @@ def cmd_serve(args, cfg: Config) -> int:
     return 0
 
 
-def serve(cfg: Config, on_listening=None, status_extra=None) -> None:
+def serve(cfg: Config, on_listening=None, status_extra=None, stop: threading.Event | None = None) -> None:
     """Servidor MCP. Escucha antes de cargar el índice de búsqueda (que puede tardar con muchos
     ficheros): mientras tanto ya responde a index_status. `on_listening` se llama al abrir el puerto."""
     import uvicorn
@@ -229,6 +229,12 @@ def serve(cfg: Config, on_listening=None, status_extra=None) -> None:
         load_index()
 
     threading.Thread(target=after_start, name="hound-startup", daemon=True).start()
+    if stop is not None:
+        def watch_stop():
+            stop.wait()
+            server.should_exit = True
+
+        threading.Thread(target=watch_stop, name="hound-stop", daemon=True).start()
     server.run()
 
 
@@ -293,17 +299,62 @@ def cmd_run(args, cfg: Config) -> int:
 
     t = threading.Thread(target=supervise, name="hound-supervisor", daemon=True)
 
+    # "hound stop" (lo usa el servicio de Windows al pararse) deja este fichero: es más fiable
+    # que Ctrl+C, que a un servicio sin consola puede no llegarle.
+    request = _stop_request_path(cfg)
+    request.unlink(missing_ok=True)
+
+    def watch_request():
+        while not stop.wait(0.5):
+            if request.exists():
+                log.info("Parada solicitada")
+                request.unlink(missing_ok=True)
+                stop.set()
+
+    threading.Thread(target=watch_request, name="hound-stop-request", daemon=True).start()
+
     def status_extra() -> dict:
         return {"indexer_process": {k: v for k, v in sup.items() if v is not None}}
 
     # Primero el MCP; el indexador arranca cuando el puerto ya está abierto.
     try:
-        serve(cfg, on_listening=t.start, status_extra=status_extra)
+        serve(cfg, on_listening=t.start, status_extra=status_extra, stop=stop)
     finally:
         stop.set()
         if t.is_alive():
             t.join(15)
     return 0
+
+
+def _stop_request_path(cfg: Config) -> Path:
+    return cfg.data_path / "stop.request"
+
+
+def cmd_stop(args, cfg: Config) -> int:
+    """Pide al servicio ("hound run") que se pare y espera a que cierre el puerto."""
+    import socket
+
+    try:
+        socket.create_connection(("127.0.0.1", cfg.server.port), timeout=1).close()
+    except OSError:
+        print("Hound no está en marcha.")
+        return 0
+    request = _stop_request_path(cfg)
+    request.parent.mkdir(parents=True, exist_ok=True)
+    request.write_text(str(time.time()))
+    end = time.monotonic() + args.timeout
+    while time.monotonic() < end:
+        if not request.exists():  # recogida: ahora se espera a que el servidor cierre el puerto
+            try:
+                with socket.create_connection(("127.0.0.1", cfg.server.port), timeout=1):
+                    pass
+            except OSError:
+                print("Hound detenido.")
+                return 0
+        time.sleep(0.5)
+    request.unlink(missing_ok=True)
+    print("Hound no se ha detenido a tiempo (¿está en marcha?).")
+    return 1
 
 
 def cmd_token(args, cfg: Config) -> int:
@@ -583,6 +634,8 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("serve", help="Solo el servidor MCP")
     sub.add_parser("run", help="Modo servicio: indexador + servidor MCP")
+    s = sub.add_parser("stop", help="Para el servicio de forma ordenada (lo usa el servicio de Windows)")
+    s.add_argument("--timeout", type=float, default=25)
 
     s = sub.add_parser("token", help="Tokens personales del MCP")
     tsub = s.add_subparsers(dest="action", required=True)
@@ -629,10 +682,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "init":
         return cmd_init(args)
     cfg = load_config(args.config)
-    if args.cmd not in ("index", "serve", "run"):
+    if args.cmd not in ("index", "serve", "run", "stop"):
         logging.basicConfig(level=logging.WARNING)
     handler = {
-        "model": cmd_model, "index": cmd_index, "serve": cmd_serve, "run": cmd_run, "token": cmd_token,
+        "model": cmd_model, "index": cmd_index, "serve": cmd_serve, "run": cmd_run, "stop": cmd_stop, "token": cmd_token,
         "status": cmd_status, "errors": cmd_errors, "reindex": cmd_reindex, "backup": cmd_backup,
         "log": cmd_log, "search": cmd_search, "doctor": cmd_doctor, "uninstall": cmd_uninstall,
     }[args.cmd]

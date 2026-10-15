@@ -220,6 +220,8 @@ if (-not $NoService) {
   <description>Buscador semantico de la carpeta compartida (servidor MCP e indexador).</description>
   <executable>$venv\Scripts\python.exe</executable>
   <arguments>-m hound --config "$config" run</arguments>
+  <stopexecutable>$venv\Scripts\python.exe</stopexecutable>
+  <stoparguments>-m hound --config "$config" stop</stoparguments>
   <env name="HOUND_CONFIG" value="$config"/>
   <workingdirectory>$DataDir</workingdirectory>
   <startmode>Automatic</startmode>
