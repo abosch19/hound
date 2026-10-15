@@ -25,14 +25,14 @@ Hound indexa els fitxers de la carpeta compartida i permet trobar-los pel seu si
 
 | Tipus | Extensions | Què se n'extreu |
 |---|---|---|
-| PDF | `.pdf` | Text per pàgina; **OCR** de les pàgines escanejades |
-| Imatges | `.jpg .png .tif .bmp .webp` | Text per **OCR** (documents fotografiats, escanejos, rètols) |
+| PDF | `.pdf` | Text per pàgina; **OCR** de les pàgines escanejades i de les que tenen la capa de text corrupta. Els PDF llargs s'indexen per trams: les primeres 30 pàgines ja es poden cercar de seguida |
+| Imatges | `.jpg .png .tif .bmp .webp` | Text per **OCR** (documents fotografiats, escanejos, rètols) i les dades **EXIF** de la foto: data, càmera, descripció |
 | AutoCAD | `.dxf`, `.dwg` | Textos, atributs de blocs (caixetins), cotes i capes. Els DWG necessiten [ODA File Converter](#fitxers-dwg-dautocad); sense ell s'indexen pel nom |
 | Word | `.docx .docm .odt .rtf` | Paràgrafs, taules, capçaleres |
 | Excel | `.xlsx .xlsm .xls .ods .csv` | Files per full, amb la capçalera com a context |
 | PowerPoint | `.pptx .pptm .odp` | Text i notes per diapositiva |
 | Correu | `.msg .eml` | Capçalera, cos i **adjunts** (PDF, Word, Excel…) |
-| Text | `.txt .md .log` | Paràgrafs |
+| Text | `.txt .md .log .html .htm` | Paràgrafs (pàgines web sense scripts ni estils) |
 | Altres | `.doc .ppt .zip .mp4`… | Només nom i carpeta |
 
 **Tots** els fitxers també es poden trobar pel nom i la carpeta, fins i tot quan no se'n pot llegir el contingut.
@@ -128,6 +128,7 @@ L'instal·lador fa el següent:
 
 En acabar la instal·lació, el servidor MCP ja respon i l'índex es construeix en segon pla. El servidor MCP és el primer que arrenca: l'indexador només comença quan el port ja és obert, de manera que pots seguir el progrés des del principi.
 
+- Abans de la primera execució: `hound estimate` recorre la carpeta sense llegir cap contingut i estima quant trigarà la indexació, per carpeta de primer nivell. Fes-lo servir per decidir què `exclude`ure.
 - Des del servidor: `hound status` (a Linux, `sudo hound status`).
 - Des de Claude Code: pregunta *"com va la indexació de Hound?"*. L'eina `index_status` retorna la fase (escanejant, indexant, en pausa, al dia, aturat), el percentatge, els fitxers pendents i amb error, els fitxers per hora, el temps estimat que queda i quants fitxers pots veure. Només retorna recomptes, mai rutes.
 
@@ -269,6 +270,8 @@ Si és en una altra ruta, indica-la a `[cad] oda_converter`.
 | `hound reindex --path "Obres\2024"` | Torna a indexar una carpeta o un fitxer |
 | `hound reindex --all` | Refà l'índex sencer (p. ex. després de canviar de model). Conserva els tokens i el registre |
 | `hound backup D:\Copies` | Còpia de seguretat en calent de l'índex |
+| `hound estimate` | Temps estimat d'indexació per carpeta de primer nivell (`--json` per al detall) |
+| `hound stop` | Atura el servei de manera neta (el fa servir el servei de Windows) |
 | `Restart-Service Hound` / `sudo systemctl restart hound` | Aplica els canvis de `config.toml` |
 
 Els registres són a `C:\ProgramData\Hound\logs` a Windows, i a `/var/lib/hound/logs` i `journalctl -u hound` a Linux. A Linux, executa aquestes ordres amb `sudo`.
@@ -307,14 +310,15 @@ El fitxer és `C:\ProgramData\Hound\config.toml` a Windows i `/etc/hound/config.
 | | `rescan_minutes` | `360` | Reescaneig complet periòdic |
 | | `watch` | `true` | Vigilància de canvis en temps real |
 | | `extract_workers` | `2` | Processos d'extracció en paral·lel |
-| `index.schedule` | `busy_hours`, `busy_days` | `08:00-19:00`, `mon-fri` | Horari laboral |
+| `index.schedule` | `busy_hours`, `busy_days` | `08:00-19:00`, `mon-fri` | Horari laboral. Pot creuar la mitjanit (`22:00-06:00`) |
 | | `busy_mode` | `slow` | `slow`, `pause` o `normal` |
+| | `max_cpu_percent` | `0` | Va a poc a poc també quan altres programes fan servir més CPU que aquest valor (%). `0` = no mesurar |
 | `ocr` | `enabled`, `languages`, `dpi` | `true`, `spa+eng`, `300` | OCR amb Tesseract |
 | `cad` | `oda_converter` | es detecta | Ruta a `ODAFileConverter.exe` |
 | `model` | `repo`, `file`, `dim` | EmbeddingGemma-300M int8, 768 | Model d'embeddings ONNX |
 | | `threads` | la meitat dels nuclis | Fils de CPU per als embeddings |
 | `search` | `memory_dtype` | `float32` | `float16` fa servir la meitat de RAM i és una mica més lent |
-| `permissions` | `mode` | `ntfs` | `ntfs` o `none` |
+| `permissions` | `mode` | `ntfs` / `posix` | `ntfs` (Windows), `posix` (Linux) o `none` |
 
 Sobre HTTPS: dins de la VPN el trànsit ja va xifrat. Si tot i així vols fer servir HTTPS amb un certificat propi, els usuaris han de configurar `NODE_EXTRA_CA_CERTS` amb la CA perquè Claude Code l'accepti.
 
@@ -335,14 +339,19 @@ Sobre HTTPS: dins de la VPN el trànsit ja va xifrat. Si tot i així vols fer se
   Amb 1 milió de fragments, la part vectorial triga uns 120 ms.
 - **Indexació incremental:**
   - un reescaneig periòdic compara la mida, la data i els permisos de cada fitxer;
-  - la vigilància de canvis (`ReadDirectoryChangesW` a Windows, inotify a Linux) reacciona a l'instant;
-  - l'extracció s'executa en processos a part amb un temps màxim per fitxer, i un fitxer que falla es registra sense aturar res.
+  - la vigilància de canvis (`ReadDirectoryChangesW` a Windows, inotify a Linux) reacciona després d'un parell de segons de calma, i recorre a un reescaneig complet quan canvia massa de cop;
+  - **els fitxers i carpetes moguts o reanomenats conserven el seu índex**: un fitxer amb el mateix ID de disc, mida i data en una ruta nova és el mateix fitxer, de manera que només canvia la ruta, sense tornar-lo a extreure ni passar-li OCR;
+  - els fitxers nous i barats van primer i les imatges amb molt d'OCR al final; els PDF llargs es llegeixen primer 30 pàgines i la resta per trams de 50 quan no queda res més pendent, desant després de cada tram;
+  - l'extracció s'executa en processos a part amb un temps màxim per fitxer, i un fitxer que falla es registra sense aturar res;
+  - el temps que queda s'estima amb el que costa de debò cada tipus de fitxer en aquest servidor (segons fixos més segons per MB, apresos dels fitxers ja indexats).
+- **Detalls del rànquing:** els fragments formats sobretot per números (files de fulls de càlcul amb imports) es guarden només per a la cerca per paraules clau, sense vector; les consultes formades sobretot per codis o números (números de factura, NIF, `2024/0153`) donen més pes a les coincidències exactes.
 
 ## Limitacions conegudes
 
 - Els `.doc` i `.ppt` antics (format binari) s'indexen només pel nom.
 - Les imatges es cerquen pel text que contenen (OCR), no pel que mostren. La cerca de fotos pel contingut i l'àudio queden per a una fase posterior.
 - Les etiquetes d'ubicació i els missatges del servidor són en castellà.
+- Les millores en l'extracció de PDF i imatges (trams, text corrupte, EXIF) s'apliquen als fitxers nous i modificats; per aplicar-les als que ja existeixen, fes servir `hound reindex --path` (repeteix el seu OCR).
 - Les rutes es comparen sense distingir majúscules, com a Windows. A Linux, dos fitxers de la mateixa carpeta els noms dels quals només es diferencien en les majúscules s'indexen com un de sol.
 
 ## Desenvolupament

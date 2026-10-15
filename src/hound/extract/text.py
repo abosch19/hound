@@ -1,10 +1,11 @@
-"""Texto plano, CSV y RTF."""
+"""Texto plano, CSV, RTF y HTML."""
 
 from __future__ import annotations
 
 import csv
 import io
 import re
+from html.parser import HTMLParser
 
 from . import Block, Extracted
 
@@ -77,3 +78,47 @@ def rtf_to_text(rtf: str) -> str:
 
 def extract_rtf(path: str) -> Extracted:
     return Extracted(blocks=paragraphs(rtf_to_text(read_text(path))))
+
+
+class _HTMLText(HTMLParser):
+    SKIP = {"script", "style", "noscript", "template", "svg", "head"}
+    BLOCK = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "section", "article",
+             "table", "ul", "ol", "header", "footer", "blockquote", "pre", "hr", "td", "th"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.title = ""
+        self._skip = 0
+        self._in_title = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self._skip += 1
+        if tag == "title":
+            self._in_title = True
+        if tag in self.BLOCK:
+            self.parts.append("\n\n" if tag not in ("br", "td", "th") else ("\n" if tag == "br" else " | "))
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP and self._skip:
+            self._skip -= 1
+        if tag == "title":
+            self._in_title = False
+        if tag in self.BLOCK:
+            self.parts.append("\n\n" if tag not in ("td", "th") else "")
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.title += data
+        elif not self._skip:
+            self.parts.append(data)
+
+
+def extract_html(path: str) -> Extracted:
+    p = _HTMLText()
+    p.feed(read_text(path))
+    p.close()
+    text = re.sub(r"[ \t]+", " ", "".join(p.parts))
+    text = re.sub(r"\n[ \t]+", "\n", text)
+    return Extracted(blocks=paragraphs(text), title=" ".join(p.title.split()))

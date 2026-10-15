@@ -131,6 +131,22 @@ def query_terms(query: str) -> list[str]:
     return [w for w in dict.fromkeys(words) if len(w) >= 2 and w not in STOPWORDS]
 
 
+_CODE = re.compile(r"[\w./-]*\d[\w./-]*")
+
+
+def lookup_weights(query: str) -> tuple[float, float]:
+    """Pesos (vectores, palabras) de la fusión. Si la consulta es sobre todo códigos o números
+    (nº de factura, NIF, expediente, "2024/0153"), manda la coincidencia exacta: el significado de
+    "B12345678" no ayuda a encontrarlo."""
+    words = [w for w in re.findall(r"\S+", query) if len(w.strip(".,;:()")) >= 2]
+    codes = [w for w in words if _CODE.fullmatch(w.strip(".,;:()")) and len(w.strip(".,;:()")) >= 3]
+    if not words or not codes:
+        return 1.0, 1.0
+    if len(codes) * 2 >= len(words):
+        return 0.5, 2.0
+    return 1.0, 1.5
+
+
 def fts_query(query: str) -> str:
     return " OR ".join(f'"{w}"*' for w in query_terms(query))
 
@@ -256,13 +272,16 @@ class SearchIndex:
                 part = rows.fetchmany(BLOCK_ROWS)
                 if not part:
                     break
+                self.last_seg = int(part[-1][0])
+                part = [r for r in part if r[2]]  # sin vector: solo búsqueda por palabras
+                if not part:
+                    continue
                 ids = np.fromiter((r[0] for r in part), dtype=np.int64, count=len(part))
                 fidx = np.fromiter((self.files.idx.get(r[1], -1) for r in part), dtype=np.int64, count=len(part))
                 vecs = np.frombuffer(b"".join(r[2] for r in part), dtype=np.float16).reshape(len(part), -1)
                 block = _VecBlock(vecs.astype(self.dtype), ids, fidx)
                 block.alive &= fidx >= 0
                 self.blocks.append(block)
-                self.last_seg = int(ids[-1])
                 new += len(part)
             self.last_seq = seq
             self.files_version += 1
@@ -450,13 +469,14 @@ class SearchIndex:
         vec = self._vector_candidates(self.embedder.embed_query(query), fmask, k)
         fts = self._fts_candidates(query, fmask, k)
         rrf_k = self.cfg.search.rrf_k
+        w_vec, w_fts = lookup_weights(query)
         fused: dict[int, float] = {}
         sim: dict[int, float] = {}
         for rank, (sid, s) in enumerate(vec):
-            fused[sid] = fused.get(sid, 0.0) + 1.0 / (rrf_k + rank + 1)
+            fused[sid] = fused.get(sid, 0.0) + w_vec / (rrf_k + rank + 1)
             sim[sid] = s
         for rank, sid in enumerate(fts):
-            fused[sid] = fused.get(sid, 0.0) + 1.0 / (rrf_k + rank + 1)
+            fused[sid] = fused.get(sid, 0.0) + w_fts / (rrf_k + rank + 1)
         if not fused:
             return []
         ranked = sorted(fused.items(), key=lambda x: -x[1])

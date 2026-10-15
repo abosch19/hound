@@ -25,14 +25,14 @@ Hound indexes the files in the shared folder so you can find them by meaning ("t
 
 | Type | Extensions | What is extracted |
 |---|---|---|
-| PDF | `.pdf` | Text per page; **OCR** of scanned pages |
-| Images | `.jpg .png .tif .bmp .webp` | Text via **OCR** (photographed documents, scans, signs) |
+| PDF | `.pdf` | Text per page; **OCR** of scanned pages and of pages whose text layer is garbled. Long PDFs are indexed in steps: the first 30 pages are searchable right away |
+| Images | `.jpg .png .tif .bmp .webp` | Text via **OCR** (photographed documents, scans, signs), and the photo's **EXIF** data: date taken, camera, description |
 | AutoCAD | `.dxf`, `.dwg` | Text, block attributes (title blocks), dimensions and layers. DWG files need [ODA File Converter](#autocad-dwg-files); without it they are indexed by name |
 | Word | `.docx .docm .odt .rtf` | Paragraphs, tables, headers |
 | Excel | `.xlsx .xlsm .xls .ods .csv` | Rows per sheet, with the header row as context |
 | PowerPoint | `.pptx .pptm .odp` | Text and notes per slide |
 | Email | `.msg .eml` | Header, body and **attachments** (PDF, Word, Excel…) |
-| Text | `.txt .md .log` | Paragraphs |
+| Text | `.txt .md .log .html .htm` | Paragraphs (web pages without scripts or styles) |
 | Other | `.doc .ppt .zip .mp4`… | Name and folder only |
 
 **Every** file can also be found by its name and folder, even when its content can't be read.
@@ -128,6 +128,7 @@ The installer does the following:
 
 When installation finishes, the MCP server is already answering and the index builds in the background. The MCP server is the first thing that starts: the indexer only starts once the port is open, so you can follow progress from the very beginning.
 
+- Before the first run: `hound estimate` walks the folder without reading any content and estimates how long indexing will take, per top-level folder. Use it to decide what to `exclude`.
 - From the server: `hound status` (on Linux, `sudo hound status`).
 - From Claude Code: ask *"how is the Hound indexing going?"*. The `index_status` tool returns the phase (scanning, indexing, paused, up to date, stopped), the percentage, pending and failed files, files per hour, the estimated time left and how many files you can see. It only returns counts, never paths.
 
@@ -269,6 +270,8 @@ If it's installed elsewhere, set the path in `[cad] oda_converter`.
 | `hound reindex --path "Projects\2024"` | Reindexes a folder or a file |
 | `hound reindex --all` | Rebuilds the whole index (e.g. after changing the model). Keeps tokens and the query log |
 | `hound backup D:\Backups` | Hot backup of the index |
+| `hound estimate` | Estimated indexing time per top-level folder (`--json` for the details) |
+| `hound stop` | Stops the service cleanly (the Windows service uses it) |
 | `Restart-Service Hound` / `sudo systemctl restart hound` | Applies `config.toml` changes |
 
 Logs are in `C:\ProgramData\Hound\logs` on Windows, and in `/var/lib/hound/logs` and `journalctl -u hound` on Linux. On Linux, run these commands with `sudo`.
@@ -307,14 +310,15 @@ The file is `C:\ProgramData\Hound\config.toml` on Windows and `/etc/hound/config
 | | `rescan_minutes` | `360` | Periodic full rescan |
 | | `watch` | `true` | Real-time change monitoring |
 | | `extract_workers` | `2` | Parallel extraction processes |
-| `index.schedule` | `busy_hours`, `busy_days` | `08:00-19:00`, `mon-fri` | Working hours |
+| `index.schedule` | `busy_hours`, `busy_days` | `08:00-19:00`, `mon-fri` | Working hours. They can cross midnight (`22:00-06:00`) |
 | | `busy_mode` | `slow` | `slow`, `pause` or `normal` |
+| | `max_cpu_percent` | `0` | Also go slowly when other programs use more CPU than this (%). `0` = don't measure |
 | `ocr` | `enabled`, `languages`, `dpi` | `true`, `spa+eng`, `300` | OCR with Tesseract |
 | `cad` | `oda_converter` | detected | Path to `ODAFileConverter.exe` |
 | `model` | `repo`, `file`, `dim` | EmbeddingGemma-300M int8, 768 | ONNX embedding model |
 | | `threads` | half the cores | CPU threads for embeddings |
 | `search` | `memory_dtype` | `float32` | `float16` uses half the RAM and is somewhat slower |
-| `permissions` | `mode` | `ntfs` | `ntfs` or `none` |
+| `permissions` | `mode` | `ntfs` / `posix` | `ntfs` (Windows), `posix` (Linux) or `none` |
 
 About HTTPS: inside the VPN traffic is already encrypted. If you still want HTTPS with your own certificate, users must set `NODE_EXTRA_CA_CERTS` to the CA so Claude Code accepts it.
 
@@ -335,14 +339,19 @@ About HTTPS: inside the VPN traffic is already encrypted. If you still want HTTP
   With 1 million fragments, the vector part takes about 120 ms.
 - **Incremental indexing:**
   - a periodic rescan compares each file's size, date and permissions;
-  - change monitoring (`ReadDirectoryChangesW` on Windows, inotify on Linux) reacts immediately;
-  - extraction runs in separate processes with a per-file time limit, and a failing file is logged without stopping anything.
+  - change monitoring (`ReadDirectoryChangesW` on Windows, inotify on Linux) reacts after a couple of seconds of quiet, and falls back to a full rescan when too much changes at once;
+  - **moved or renamed files and folders keep their index**: a file with the same disk ID, size and date at a new path is the same file, so only its path changes, without extracting or OCR'ing it again;
+  - new and cheap files go first and OCR-heavy images last; long PDFs are read 30 pages first and the rest in steps of 50 once nothing else is pending, saving after each step;
+  - extraction runs in separate processes with a per-file time limit, and a failing file is logged without stopping anything;
+  - the time left is estimated with what each file type actually costs on this server (seconds fixed plus per MB, learned from the files already indexed).
+- **Ranking details:** fragments that are mostly numbers (spreadsheet rows of amounts) are kept for keyword search only, without a vector; queries that are mostly codes or numbers (invoice numbers, tax IDs, `2024/0153`) give more weight to exact matches.
 
 ## Known limitations
 
 - Old `.doc` and `.ppt` files (binary format) are indexed by name only.
 - Images are searched by the text they contain (OCR), not by what they show. Photo search by content and audio are planned for a later phase.
 - Location labels and server messages are in Spanish.
+- Improvements to PDF and image extraction (steps, garbled text, EXIF) apply to new and changed files; to apply them to existing ones, use `hound reindex --path` (it repeats their OCR).
 - Paths are compared case-insensitively, as on Windows. On Linux, two files in the same folder whose names differ only in case are indexed as one.
 
 ## Development

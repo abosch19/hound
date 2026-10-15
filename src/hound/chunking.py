@@ -21,6 +21,12 @@ class Chunk:
     location: str
 
 
+def has_words(text: str, min_ratio: float = 0.2) -> bool:
+    """True si el texto tiene suficientes letras para que su vector signifique algo."""
+    t = "".join(text.split())
+    return bool(t) and sum(c.isalpha() for c in t) / len(t) >= min_ratio
+
+
 def _location(group: str, unit: str, first: int | None, last: int | None) -> str:
     parts = [group] if group else []
     if unit and first is not None:

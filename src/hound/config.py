@@ -12,7 +12,7 @@ from typing import Any
 DEFAULT_EXTENSIONS = [
     # documentos
     ".pdf", ".docx", ".docm", ".xlsx", ".xlsm", ".xls", ".pptx", ".pptm",
-    ".odt", ".ods", ".odp", ".msg", ".eml", ".txt", ".csv", ".md", ".rtf",
+    ".odt", ".ods", ".odp", ".msg", ".eml", ".txt", ".csv", ".md", ".rtf", ".html", ".htm",
     # imágenes (OCR)
     ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp",
     # CAD
@@ -61,10 +61,14 @@ class ServerConfig:
 @dataclass
 class ScheduleConfig:
     busy_hours: str = "08:00-19:00"
+    """Puede cruzar la medianoche ("22:00-06:00")."""
     busy_days: str = "mon-fri"
     busy_mode: str = "slow"
     """slow: indexa despacio en horario laboral; pause: no indexa; normal: sin cambios."""
     busy_pause_ms: int = 500
+    max_cpu_percent: int = 0
+    """Si los demás programas usan más CPU que esto (en %), el indexador va despacio aunque no sea
+    horario laboral. 0 = no se mide."""
 
 
 @dataclass

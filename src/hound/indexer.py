@@ -19,13 +19,14 @@ import sqlite3
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
 from . import db
-from .chunking import Chunk, chunk_blocks
+from .chunking import Chunk, chunk_blocks, has_words
 from .config import Config
+from .costs import CostModel
 from .embed import Embedder
 from .extract import ExtractOptions, Extracted, capabilities, extract, extractor_tag, kind_of
 from .paths import Excluder, norm_rel, to_abs
@@ -35,6 +36,8 @@ from .status import set_state
 log = logging.getLogger("hound.indexer")
 
 EMBED_BATCH_CHUNKS = 64
+PDF_FIRST_PAGES = 30   # primera pasada de un PDF largo: ya se puede buscar
+PDF_STEP_PAGES = 50    # pasadas siguientes, cuando no queda nada pendiente
 
 
 @dataclass
@@ -44,6 +47,7 @@ class ScanStats:
     changed: int = 0
     deleted: int = 0
     perms_changed: int = 0
+    moved: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -88,8 +92,46 @@ def parse_schedule(cfg: Config, now: dt.datetime | None = None) -> bool:
         h0, h1 = (dt.time.fromisoformat(x.strip()) for x in s.busy_hours.split("-"))
     except (ValueError, KeyError):
         return False
-    in_days = d0 <= now.weekday() <= d1 if d0 <= d1 else (now.weekday() >= d0 or now.weekday() <= d1)
-    return in_days and h0 <= now.time() < h1
+
+    def in_days(wd: int) -> bool:
+        return d0 <= wd <= d1 if d0 <= d1 else (wd >= d0 or wd <= d1)
+
+    t = now.time()
+    if h0 <= h1:
+        return in_days(now.weekday()) and h0 <= t < h1
+    # Franja que cruza la medianoche (p. ej. 22:00-06:00): de madrugada cuenta el día anterior.
+    return (t >= h0 and in_days(now.weekday())) or (t < h1 and in_days((now.weekday() - 1) % 7))
+
+
+class LoadMeter:
+    """CPU que usan los demás programas del servidor (sin contar al propio Hound), en %."""
+
+    def __init__(self):
+        import psutil
+
+        self.psutil = psutil
+        self.me = psutil.Process()
+        self.ncpu = psutil.cpu_count() or 1
+        psutil.cpu_percent(None)
+        self._own: dict[int, object] = {}
+
+    def others_percent(self) -> float:
+        total = self.psutil.cpu_percent(None)
+        own = 0.0
+        try:
+            procs = [self.me, *self.me.children(recursive=True)]
+        except self.psutil.Error:
+            procs = [self.me]
+        alive = {}
+        for p in procs:
+            proc = self._own.get(p.pid, p)
+            try:
+                own += proc.cpu_percent(None)
+                alive[p.pid] = proc
+            except self.psutil.Error:
+                pass
+        self._own = alive
+        return max(0.0, total - own / self.ncpu)
 
 
 class Indexer:
@@ -111,7 +153,10 @@ class Indexer:
         self._share_sd: bytes | None = None
         self._pool: cf.ProcessPoolExecutor | None = None
         self._changed: set[tuple[str, bool]] = set()
+        self._moves: list[tuple[str, str]] = []
+        self._first_event = self._last_event = 0.0
         self._changed_lock = threading.Lock()
+        self.costs = CostModel.load(self.conn)
         model = db.get_meta(self.conn, "model")
         if model is None:
             db.set_meta(self.conn, "model", embedder.name)
@@ -138,7 +183,7 @@ class Indexer:
     # --- escaneo ----------------------------------------------------------------
 
     def _known(self, subtree: str, recursive: bool) -> dict[str, sqlite3.Row]:
-        q = "SELECT id, path, size, mtime, sd_id, status, extractor, kind FROM files"
+        q = "SELECT id, path, size, mtime, sd_id, status, extractor, kind, inode, dev FROM files"
         if subtree:
             rows = self.conn.execute(q + " WHERE path >= ? AND path < ?", (subtree + "/", subtree + "0"))
         else:
@@ -166,6 +211,7 @@ class Indexer:
             set_state(self.conn, "scanning", seen=0)
             self.conn.commit()
         known = self._known(subtree, recursive)
+        new_files: list[tuple[str, str, str, os.stat_result]] = []
         failed_dirs: list[str] = []
         start = to_abs(subtree, self.root)
         if not os.path.isdir(start):
@@ -202,7 +248,11 @@ class Indexer:
                         continue
                     stats.seen += 1
                     try:
-                        self._scan_file(e.path, rel, ext, known.pop(rel.lower(), None), stats)
+                        row = known.pop(rel.lower(), None)
+                        if row is None:  # nuevo… o movido: se decide al final, con lo que ya no está
+                            new_files.append((e.path, rel, ext, os.stat(e.path)))
+                        else:
+                            self._scan_file(e.path, rel, ext, row, stats)
                     except Exception as exc:  # noqa: BLE001
                         failed_dirs.append(rel)
                         stats.errors.append(f"{rel}: {exc}")
@@ -214,32 +264,54 @@ class Indexer:
                         self.conn.commit()
                         pending_commit = 0
         # Lo que queda en `known` ya no está en el disco (salvo en carpetas que no se pudieron leer).
-        for key, row in known.items():
-            if any(key == f.lower() or key.startswith(f.lower() + "/") for f in failed_dirs if f) or \
-                    ("" in failed_dirs):
+        gone = {key: row for key, row in known.items()
+                if not ("" in failed_dirs or
+                        any(key == f.lower() or key.startswith(f.lower() + "/") for f in failed_dirs if f))}
+        # Un fichero nuevo con el mismo inodo, tamaño y fecha que uno desaparecido es el mismo, movido o
+        # renombrado: se cambia la ruta y se conserva lo indexado (sin repetir extracción ni OCR).
+        by_inode = {(r["dev"], r["inode"], r["size"]): (k, r) for k, r in gone.items() if r["inode"]}
+        for abs_path, rel, ext, st in new_files:
+            hit = by_inode.get((st.st_dev, st.st_ino, st.st_size)) if st.st_ino else None
+            if hit and abs(hit[1]["mtime"] - st.st_mtime) < 1e-3:
+                key, row = hit
+                del gone[key], by_inode[(row["dev"], row["inode"], row["size"])]
+                self._move_file(row, rel, abs_path)
+                stats.moved += 1
                 continue
+            try:
+                self._scan_file(abs_path, rel, ext, None, stats, st)
+            except Exception as exc:  # noqa: BLE001
+                stats.errors.append(f"{rel}: {exc}")
+                log.warning("Error al examinar %s: %s", rel, exc)
+        for row in gone.values():
             self._delete_file(row["id"])
             stats.deleted += 1
         if not subtree and recursive:
             db.set_meta(self.conn, "last_full_scan", str(time.time()))
         db.prune_tombstones(self.conn)
         self.conn.commit()
-        if stats.new or stats.changed or stats.deleted or stats.perms_changed:
-            log.info("Escaneo %s: %d ficheros, %d nuevos, %d modificados, %d borrados, %d con permisos cambiados",
-                     subtree or "/", stats.seen, stats.new, stats.changed, stats.deleted, stats.perms_changed)
+        if stats.new or stats.changed or stats.deleted or stats.perms_changed or stats.moved:
+            log.info("Escaneo %s: %d ficheros, %d nuevos, %d modificados, %d movidos, %d borrados, "
+                     "%d con permisos cambiados", subtree or "/", stats.seen, stats.new, stats.changed,
+                     stats.moved, stats.deleted, stats.perms_changed)
         return stats
 
-    def _scan_file(self, abs_path: str, rel: str, ext: str, row: sqlite3.Row | None, stats: ScanStats) -> None:
-        st = os.stat(abs_path)
+    def _scan_file(self, abs_path: str, rel: str, ext: str, row: sqlite3.Row | None, stats: ScanStats,
+                   st: os.stat_result | None = None) -> None:
+        st = st or os.stat(abs_path)
         sd_id = self._sd_id(abs_path)
         kind = kind_of(ext)
         if row is None:
             self.conn.execute(
-                "INSERT INTO files(path, name, ext, kind, size, mtime, sd_id, status, seq) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
-                (rel, rel.rpartition("/")[2], ext, kind, st.st_size, st.st_mtime, sd_id, db.next_seq(self.conn)))
+                "INSERT INTO files(path, name, ext, kind, size, mtime, sd_id, status, seq, inode, dev) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+                (rel, rel.rpartition("/")[2], ext, kind, st.st_size, st.st_mtime, sd_id, db.next_seq(self.conn),
+                 st.st_ino or None, st.st_dev))
             stats.new += 1
             return
+        if row["inode"] != (st.st_ino or None):  # índices anteriores a esta columna, o fichero sustituido
+            self.conn.execute("UPDATE files SET inode = ?, dev = ? WHERE id = ?",
+                              (st.st_ino or None, st.st_dev, row["id"]))
         changed = row["size"] != st.st_size or abs(row["mtime"] - st.st_mtime) > 1e-3 or \
             (row["status"] != "pending" and row["extractor"] != extractor_tag(kind, self.caps))
         if changed:
@@ -252,6 +324,18 @@ class Indexer:
             self.conn.execute("UPDATE files SET sd_id = ?, path = ?, name = ?, seq = ? WHERE id = ?",
                               (sd_id, rel, rel.rpartition("/")[2], db.next_seq(self.conn), row["id"]))
             stats.perms_changed += 1
+
+    def _move_file(self, row: sqlite3.Row, rel: str, abs_path: str) -> None:
+        """Cambia la ruta de un fichero ya indexado y rehace su entrada de palabras clave (el nombre
+        forma parte de ella). Los vectores se conservan."""
+        name_text = rel.replace("/", " ")
+        segs = self.conn.execute("SELECT id, text FROM segments WHERE file_id = ?", (row["id"],)).fetchall()
+        self.conn.executemany("DELETE FROM segments_fts WHERE rowid = ?", [(r["id"],) for r in segs])
+        self.conn.executemany("INSERT INTO segments_fts(rowid, text, name) VALUES (?, ?, ?)",
+                              [(r["id"], r["text"], name_text) for r in segs])
+        self.conn.execute("UPDATE files SET path = ?, name = ?, sd_id = ?, seq = ? WHERE id = ?",
+                          (rel, rel.rpartition("/")[2], self._sd_id(abs_path), db.next_seq(self.conn), row["id"]))
+        log.info("Movido: %s -> %s", row["path"], rel)
 
     def _delete_file(self, file_id: int) -> None:
         ids = [r[0] for r in self.conn.execute("SELECT id FROM segments WHERE file_id = ?", (file_id,))]
@@ -298,11 +382,11 @@ class Indexer:
         while queue or running:
             while queue and len(running) < workers:
                 row = queue.pop(0)
-                fut = self._pool.submit(_extract_worker, to_abs(row["path"], self.root), self.opts)
+                fut = self._pool.submit(_extract_worker, to_abs(row["path"], self.root), self._opts_for(row))
                 running[fut] = (row, time.monotonic())
             done, _ = cf.wait(running, timeout=1, return_when=cf.FIRST_COMPLETED)
             for fut in done:
-                row, _t = running.pop(fut)
+                row, t0 = running.pop(fut)
                 try:
                     ex, err = fut.result()
                 except Exception as exc:  # noqa: BLE001 — p. ej. el proceso murió
@@ -311,14 +395,14 @@ class Indexer:
                     self._pool = self._new_pool()
                     queue = [r for r, _ in running.values()] + queue
                     running.clear()
-                yield row, ex, err
+                yield row, ex, err, time.monotonic() - t0
             now = time.monotonic()
             late = [f for f, (_r, t) in running.items() if now - t > timeout]
             if late:
                 # Un fichero se ha colgado: se reinicia el pool y se reintentan los demás.
                 for f in late:
-                    row, _t = running.pop(f)
-                    yield row, None, f"Tiempo de extracción agotado ({timeout} s)"
+                    row, t0 = running.pop(f)
+                    yield row, None, f"Tiempo de extracción agotado ({timeout} s)", now - t0
                 queue = [r for r, _ in running.values()] + queue
                 running.clear()
                 self._kill_pool()
@@ -328,9 +412,15 @@ class Indexer:
 
     def process_pending(self, max_files: int = 200, stop: threading.Event | None = None,
                         throttle: float = 0.0) -> int:
+        cols = "SELECT id, path, ext, kind, size, mtime, status, pages_done FROM files"
+        # Primero lo nuevo y lo barato (las imágenes, con OCR, al final); los PDF largos se
+        # terminan cuando ya no queda nada pendiente.
         rows = self.conn.execute(
-            "SELECT id, path, ext, kind, size, mtime FROM files WHERE status = 'pending' "
-            "ORDER BY mtime DESC LIMIT ?", (max_files,)).fetchall()
+            cols + " WHERE status = 'pending' ORDER BY kind IN ('image', 'cad'), mtime DESC LIMIT ?",
+            (max_files,)).fetchall()
+        if not rows:
+            rows = self.conn.execute(cols + " WHERE status = 'partial' ORDER BY mtime DESC LIMIT ?",
+                                     (max(1, max_files // 10),)).fetchall()
         if not rows:
             return 0
         batch: list[tuple[sqlite3.Row, list[Chunk], str, str | None, bool]] = []
@@ -340,11 +430,20 @@ class Indexer:
         big = [r for r in rows if r["size"] > max_bytes]
         small = [r for r in rows if r["size"] <= max_bytes]
         results = [(r, Extracted(notes=[f"Fichero mayor de {self.cfg.index.max_file_mb} MB: indexado solo por nombre"]),
-                    None) for r in big]
+                    None, 0.0) for r in big]
+        workers = max(1, self.cfg.index.extract_workers)
         for item in [*results, *self._extract_many(small, stop)]:
-            row, ex, err = item
+            row, ex, err, elapsed = item
             failed = ex is None and err is not None
-            chunks = [name_chunk(row["path"])]
+            continuing = row["status"] == "partial"
+            if continuing and failed:
+                if not os.path.isfile(to_abs(row["path"], self.root)):
+                    continue  # movido o borrado mientras se leía: el escaneo lo resuelve y luego se sigue
+                # El tramo falla de verdad (p. ej. tiempo agotado): se da por terminado con lo ya leído.
+                done_pages = row["pages_done"] or 0
+                ex = Extracted(pages_done=done_pages, pages_total=done_pages)
+                err, failed = f"PDF indexado solo hasta la página {done_pages}: {err}", False
+            chunks = [] if continuing else [name_chunk(row["path"])]
             title = ""
             if ex is not None:
                 title = ex.title.strip()
@@ -354,7 +453,7 @@ class Indexer:
                 chunks += chunk_blocks(ex.blocks, self.cfg.search.chunk_chars, self.cfg.search.chunk_overlap)
                 if ex.notes and not err:
                     err = "; ".join(ex.notes)[:500]
-            batch.append((row, chunks, title, err, failed))
+            batch.append((row, chunks, title, err, failed, ex, elapsed / workers))
             n_chunks += len(chunks)
             if n_chunks >= EMBED_BATCH_CHUNKS:
                 done += self._write(batch)
@@ -368,45 +467,82 @@ class Indexer:
         return done
 
     def _write(self, batch) -> int:
-        items = []
-        for row, chunks, title, _err, _failed in batch:
+        # Fragmentos casi sin letras (tablas de cifras) solo van al índice de palabras: un vector de
+        # números no aporta significado, ocupa memoria y mete ruido en las búsquedas por sentido.
+        items, want = [], []
+        for row, chunks, title, _err, _failed, _ex, _cost in batch:
             name = row["path"].rpartition("/")[2]
-            items.extend((title or name, c.text) for c in chunks)
-        vecs = self.embedder.embed_documents(items).astype(np.float16)
+            keep = [k == 0 and row["status"] != "partial" or has_words(c.text) for k, c in enumerate(chunks)]
+            want.append(keep)
+            items.extend((title or name, c.text) for c, k in zip(chunks, keep) if k)
+        t0 = time.monotonic()
+        vecs = self.embedder.embed_documents(items).astype(np.float16) if items else np.zeros((0, 1), np.float16)
+        embed_s = time.monotonic() - t0
         i = 0
         conn = self.conn
         with conn:
-            for row, chunks, _title, err, failed in batch:
+            for (row, chunks, _title, err, failed, ex, cost), keep in zip(batch, want):
+                n_vec = sum(keep)
                 cur = conn.execute("SELECT size, mtime, status FROM files WHERE id = ?", (row["id"],)).fetchone()
                 if cur is None:  # se borró mientras se procesaba
-                    i += len(chunks)
+                    i += n_vec
                     continue
-                old = conn.execute("SELECT max(id) FROM segments WHERE file_id = ?", (row["id"],)).fetchone()[0]
-                if old is not None:
-                    conn.execute("DELETE FROM segments_fts WHERE rowid IN (SELECT id FROM segments WHERE file_id = ?)",
-                                 (row["id"],))
-                    conn.execute("DELETE FROM segments WHERE file_id = ?", (row["id"],))
-                    conn.execute("INSERT INTO tombstones(file_id, upto_seg, ts) VALUES (?, ?, ?)",
-                                 (row["id"], old, time.time()))
+                continuing = row["status"] == "partial"
+                ord0 = 0
+                if continuing:
+                    ord0 = (conn.execute("SELECT max(ord) FROM segments WHERE file_id = ?",
+                                         (row["id"],)).fetchone()[0] or 0) + 1
+                else:
+                    old = conn.execute("SELECT max(id) FROM segments WHERE file_id = ?", (row["id"],)).fetchone()[0]
+                    if old is not None:
+                        conn.execute("DELETE FROM segments_fts WHERE rowid IN "
+                                     "(SELECT id FROM segments WHERE file_id = ?)", (row["id"],))
+                        conn.execute("DELETE FROM segments WHERE file_id = ?", (row["id"],))
+                        conn.execute("INSERT INTO tombstones(file_id, upto_seg, ts) VALUES (?, ?, ?)",
+                                     (row["id"], old, time.time()))
                 name_text = row["path"].replace("/", " ")
-                for ord_, c in enumerate(chunks):
+                for k, (c, vec_ok) in enumerate(zip(chunks, keep)):
+                    vec = vecs[i].tobytes() if vec_ok else b""
+                    i += vec_ok
                     seg = conn.execute(
                         "INSERT INTO segments(file_id, ord, location, text, vec) VALUES (?, ?, ?, ?, ?)",
-                        (row["id"], ord_, c.location, c.text, vecs[i].tobytes()))
+                        (row["id"], ord0 + k, c.location, c.text, vec))
                     conn.execute("INSERT INTO segments_fts(rowid, text, name) VALUES (?, ?, ?)",
                                  (seg.lastrowid, c.text, name_text))
-                    i += 1
+                pages_done = ex.pages_done if ex is not None else None
+                pages_total = ex.pages_total if ex is not None else None
                 # Si cambió mientras se extraía, se deja pendiente para la próxima vuelta.
                 still_same = cur["size"] == row["size"] and abs(cur["mtime"] - row["mtime"]) < 1e-3
-                status = ("error" if failed else "indexed") if still_same else "pending"
-                conn.execute("UPDATE files SET status = ?, error = ?, extractor = ?, indexed_at = ?, seq = ? "
-                             "WHERE id = ?",
+                if not still_same:
+                    status = "pending"
+                elif failed:
+                    status = "error"
+                elif pages_done is not None and pages_total and pages_done < pages_total:
+                    status = "partial"
+                else:
+                    status = "indexed"
+                conn.execute("UPDATE files SET status = ?, error = ?, extractor = ?, indexed_at = ?, seq = ?, "
+                             "pages_done = ?, pages_total = ? WHERE id = ?",
                              (status, err, extractor_tag(row["kind"], self.caps), time.time(),
-                              db.next_seq(conn), row["id"]))
+                              db.next_seq(conn), pages_done or 0, pages_total, row["id"]))
+                if not failed and still_same:
+                    mb = row["size"] / 1e6
+                    if pages_total and pages_done is not None:
+                        before = row["pages_done"] if continuing else 0
+                        mb *= max(0, pages_done - before) / pages_total
+                    self.costs.add(row["kind"], mb, cost + embed_s * n_vec / max(1, len(items)))
                 if err:
                     log.info("%s: %s", row["path"], err)
+            self.costs.save(conn)
             set_state(conn, "indexing")  # latido: un lote con OCR puede tardar mucho
         return len(batch)
+
+    def _opts_for(self, row: sqlite3.Row) -> ExtractOptions:
+        if row["kind"] != "pdf":
+            return self.opts
+        if row["status"] == "partial":
+            return replace(self.opts, page_start=row["pages_done"] or 0, page_limit=PDF_STEP_PAGES)
+        return replace(self.opts, page_start=0, page_limit=PDF_FIRST_PAGES)
 
     # --- vigilancia ---------------------------------------------------------------
 
@@ -422,6 +558,19 @@ class Indexer:
             def on_any_event(self, event):
                 if event.event_type in ("opened", "closed", "closed_no_write"):
                     return
+                if event.event_type == "moved" and event.dest_path:
+                    try:
+                        move = (norm_rel(os.path.relpath(event.src_path, indexer.root)),
+                                norm_rel(os.path.relpath(event.dest_path, indexer.root)))
+                    except ValueError:
+                        move = None
+                    if move:
+                        with indexer._changed_lock:
+                            indexer._moves.append(move)
+                now = time.monotonic()
+                with indexer._changed_lock:
+                    indexer._first_event = indexer._first_event or now
+                    indexer._last_event = now
                 for p in (event.src_path, getattr(event, "dest_path", "")):
                     if not p:
                         continue
@@ -442,9 +591,44 @@ class Indexer:
         log.info("Vigilando cambios en %s", self.root)
         return obs
 
-    def _drain_changes(self) -> None:
+    QUIET_S = 2.0       # se espera a que los cambios paren un momento…
+    MAX_WAIT_S = 30.0   # …pero no más de esto
+    MAX_CHANGES = 2000  # con más carpetas cambiadas (o avisos perdidos) sale a cuenta un escaneo completo
+
+    def changes_ready(self, now: float | None = None) -> bool:
+        now = now or time.monotonic()
+        with self._changed_lock:
+            if not self._changed and not self._moves:
+                return False
+            return now - self._last_event >= self.QUIET_S or now - self._first_event >= self.MAX_WAIT_S
+
+    def _apply_moves(self, moves: list[tuple[str, str]]) -> None:
+        """Renombrados y movimientos que ha visto el vigilante: se cambia la ruta sin reindexar."""
+        for src, dest in moves:
+            if not src or not dest or self.excluder.excluded(dest):
+                continue  # a una carpeta excluida: lo borrará el escaneo
+            rows = self.conn.execute("SELECT id, path FROM files WHERE path = ? OR (path >= ? AND path < ?)",
+                                     (src, src + "/", src + "0")).fetchall()
+            for row in rows:
+                new = dest + row["path"][len(src):]
+                abs_new = to_abs(new, self.root)
+                if not os.path.isfile(abs_new) or os.path.splitext(new)[1].lower() not in self.extensions:
+                    continue
+                if self.conn.execute("SELECT 1 FROM files WHERE path = ?", (new,)).fetchone():
+                    continue
+                self._move_file(row, new, abs_new)
+        self.conn.commit()
+
+    def _drain_changes(self) -> bool:
+        """Procesa los cambios vistos. Devuelve False si hacen falta un escaneo completo."""
         with self._changed_lock:
             changed, self._changed = self._changed, set()
+            moves, self._moves = self._moves, []
+            self._first_event = self._last_event = 0.0
+        if moves:
+            self._apply_moves(moves)
+        if len(changed) > self.MAX_CHANGES or ("", True) in changed:
+            return False
         recursive_dirs = {d for d, r in changed if r}
         for d, rec in sorted(changed):
             if not rec and any(d == r or d.startswith(r + "/") for r in recursive_dirs if r):
@@ -453,11 +637,18 @@ class Indexer:
                 self.scan(d, recursive=rec)
             except Exception as exc:  # noqa: BLE001
                 log.warning("Error al reescanear %s: %s", d or "/", exc)
+        return True
 
     def run_forever(self, stop: threading.Event) -> None:
         lower_priority()
         log.info("Indexador iniciado. Carpeta: %s. Capacidades: %s", self.root, ", ".join(sorted(self.caps)) or "-")
         observer = self._start_watcher() if self.cfg.index.watch else None
+        meter = None
+        if self.cfg.index.schedule.max_cpu_percent:
+            try:
+                meter = LoadMeter()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("No se puede medir la carga del servidor: %s", exc)
         last_full = 0.0
         epoch = db.get_meta(self.conn, "epoch", "")
         try:
@@ -475,9 +666,17 @@ class Indexer:
                     except Exception as exc:  # noqa: BLE001
                         log.error("Escaneo completo fallido: %s", exc)
                     last_full = time.time()
-                self._drain_changes()
-                busy = parse_schedule(self.cfg)
-                mode = self.cfg.index.schedule.busy_mode if busy else "normal"
+                if self.changes_ready() and not self._drain_changes():
+                    log.info("Demasiados cambios a la vez (o avisos perdidos): escaneo completo")
+                    last_full = 0.0
+                    continue
+                sched = self.cfg.index.schedule
+                busy_hours = parse_schedule(self.cfg)
+                loaded = False
+                if sched.max_cpu_percent and meter is not None:
+                    loaded = meter.others_percent() > sched.max_cpu_percent
+                busy = busy_hours or loaded
+                mode = sched.busy_mode if busy_hours else ("slow" if loaded else "normal")
                 backlog = self.conn.execute("SELECT count(*) FROM files WHERE status = 'pending'").fetchone()[0]
                 if mode == "pause" and backlog > 200:
                     set_state(self.conn, "paused")
@@ -491,7 +690,7 @@ class Indexer:
                 if n == 0:
                     set_state(self.conn, "idle")
                     self.conn.commit()
-                    stop.wait(5)
+                    stop.wait(2)
         finally:
             if observer is not None:
                 observer.stop()

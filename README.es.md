@@ -25,14 +25,14 @@ Hound indexa los ficheros de la carpeta compartida y permite encontrarlos por su
 
 | Tipo | Extensiones | Qué se extrae |
 |---|---|---|
-| PDF | `.pdf` | Texto por página; **OCR** de las páginas escaneadas |
-| Imágenes | `.jpg .png .tif .bmp .webp` | Texto por **OCR** (documentos fotografiados, escaneos, rótulos) |
+| PDF | `.pdf` | Texto por página; **OCR** de las páginas escaneadas y de las que tienen la capa de texto corrupta. Los PDF largos se indexan por tramos: las primeras 30 páginas ya se pueden buscar enseguida |
+| Imágenes | `.jpg .png .tif .bmp .webp` | Texto por **OCR** (documentos fotografiados, escaneos, rótulos) y los datos **EXIF** de la foto: fecha, cámara, descripción |
 | AutoCAD | `.dxf`, `.dwg` | Textos, atributos de bloques (cajetines), cotas y capas. Los DWG necesitan [ODA File Converter](#ficheros-dwg-de-autocad); sin él se indexan por nombre |
 | Word | `.docx .docm .odt .rtf` | Párrafos, tablas, encabezados |
 | Excel | `.xlsx .xlsm .xls .ods .csv` | Filas por hoja, con la cabecera como contexto |
 | PowerPoint | `.pptx .pptm .odp` | Texto y notas por diapositiva |
 | Correo | `.msg .eml` | Cabecera, cuerpo y **adjuntos** (PDF, Word, Excel…) |
-| Texto | `.txt .md .log` | Párrafos |
+| Texto | `.txt .md .log .html .htm` | Párrafos (páginas web sin scripts ni estilos) |
 | Otros | `.doc .ppt .zip .mp4`… | Solo nombre y carpeta |
 
 **Todos** los ficheros se pueden encontrar también por su nombre y su carpeta, incluso cuando no se puede leer su contenido.
@@ -128,6 +128,7 @@ El instalador hace lo siguiente:
 
 Al terminar la instalación, el servidor MCP ya responde y el índice se construye en segundo plano. El servidor MCP es lo primero que arranca: el indexador solo empieza cuando el puerto ya está abierto, así que puedes seguir el progreso desde el principio.
 
+- Antes de la primera ejecución: `hound estimate` recorre la carpeta sin leer ningún contenido y estima cuánto tardará la indexación, por carpeta de primer nivel. Úsalo para decidir qué `exclude`ar.
 - Desde el servidor: `hound status` (en Linux, `sudo hound status`).
 - Desde Claude Code: pregunta *"¿cómo va la indexación de Hound?"*. La herramienta `index_status` devuelve la fase (escaneando, indexando, en pausa, al día, detenido), el porcentaje, los ficheros pendientes y con error, los ficheros por hora, el tiempo estimado que queda y cuántos ficheros puedes ver. Solo devuelve recuentos, nunca rutas.
 
@@ -269,6 +270,8 @@ Si está en otra ruta, indícala en `[cad] oda_converter`.
 | `hound reindex --path "Obras\2024"` | Reindexa una carpeta o un fichero |
 | `hound reindex --all` | Rehace el índice entero (p. ej. tras cambiar de modelo). Conserva tokens y registro |
 | `hound backup D:\Copias` | Copia de seguridad en caliente del índice |
+| `hound estimate` | Tiempo estimado de indexación por carpeta de primer nivel (`--json` para el detalle) |
+| `hound stop` | Detiene el servicio de forma limpia (lo usa el servicio de Windows) |
 | `Restart-Service Hound` / `sudo systemctl restart hound` | Aplica cambios de `config.toml` |
 
 Los registros están en `C:\ProgramData\Hound\logs` en Windows, y en `/var/lib/hound/logs` y `journalctl -u hound` en Linux. En Linux, ejecuta estas órdenes con `sudo`.
@@ -307,14 +310,15 @@ El fichero es `C:\ProgramData\Hound\config.toml` en Windows y `/etc/hound/config
 | | `rescan_minutes` | `360` | Reescaneo completo periódico |
 | | `watch` | `true` | Vigilancia de cambios en tiempo real |
 | | `extract_workers` | `2` | Procesos de extracción en paralelo |
-| `index.schedule` | `busy_hours`, `busy_days` | `08:00-19:00`, `mon-fri` | Horario laboral |
+| `index.schedule` | `busy_hours`, `busy_days` | `08:00-19:00`, `mon-fri` | Horario laboral. Puede cruzar la medianoche (`22:00-06:00`) |
 | | `busy_mode` | `slow` | `slow`, `pause` o `normal` |
+| | `max_cpu_percent` | `0` | Va despacio también cuando otros programas usan más CPU que este valor (%). `0` = no medir |
 | `ocr` | `enabled`, `languages`, `dpi` | `true`, `spa+eng`, `300` | OCR con Tesseract |
 | `cad` | `oda_converter` | se detecta | Ruta a `ODAFileConverter.exe` |
 | `model` | `repo`, `file`, `dim` | EmbeddingGemma-300M int8, 768 | Modelo de embeddings ONNX |
 | | `threads` | la mitad de los núcleos | Hilos de CPU para los embeddings |
 | `search` | `memory_dtype` | `float32` | `float16` usa la mitad de RAM y es algo más lento |
-| `permissions` | `mode` | `ntfs` | `ntfs` o `none` |
+| `permissions` | `mode` | `ntfs` / `posix` | `ntfs` (Windows), `posix` (Linux) o `none` |
 
 Sobre HTTPS: dentro de la VPN el tráfico ya va cifrado. Si aun así quieres usar HTTPS con un certificado propio, los usuarios deben configurar `NODE_EXTRA_CA_CERTS` con la CA para que Claude Code lo acepte.
 
@@ -335,14 +339,19 @@ Sobre HTTPS: dentro de la VPN el tráfico ya va cifrado. Si aun así quieres usa
   Con 1 millón de fragmentos, la parte vectorial tarda unos 120 ms.
 - **Indexado incremental:**
   - un reescaneo periódico compara el tamaño, la fecha y los permisos de cada fichero;
-  - la vigilancia de cambios (`ReadDirectoryChangesW` en Windows, inotify en Linux) reacciona al momento;
-  - la extracción corre en procesos aparte con tiempo máximo por fichero, y un fichero que falla se registra y no detiene nada.
+  - la vigilancia de cambios (`ReadDirectoryChangesW` en Windows, inotify en Linux) reacciona tras un par de segundos de calma, y recurre a un reescaneo completo cuando cambia demasiado de golpe;
+  - **los ficheros y carpetas movidos o renombrados conservan su índice**: un fichero con el mismo ID de disco, tamaño y fecha en una ruta nueva es el mismo fichero, así que solo cambia su ruta, sin volver a extraerlo ni a pasarle OCR;
+  - los ficheros nuevos y baratos van primero y las imágenes con mucho OCR al final; los PDF largos se leen primero 30 páginas y el resto en tramos de 50 cuando no queda nada más pendiente, guardando tras cada tramo;
+  - la extracción corre en procesos aparte con tiempo máximo por fichero, y un fichero que falla se registra y no detiene nada;
+  - el tiempo que queda se estima con lo que cuesta de verdad cada tipo de fichero en este servidor (segundos fijos más segundos por MB, aprendidos de los ficheros ya indexados).
+- **Detalles del ranking:** los fragmentos formados sobre todo por números (filas de hojas de cálculo con importes) se guardan solo para la búsqueda por palabras clave, sin vector; las consultas formadas sobre todo por códigos o números (números de factura, NIF, `2024/0153`) dan más peso a las coincidencias exactas.
 
 ## Limitaciones conocidas
 
 - `.doc` y `.ppt` antiguos (formato binario) se indexan solo por nombre.
 - Las imágenes se buscan por el texto que contienen (OCR), no por lo que muestran. La búsqueda de fotos por contenido y el audio quedan para una fase posterior.
 - Las etiquetas de ubicación y los mensajes del servidor están en español.
+- Las mejoras en la extracción de PDF e imágenes (tramos, texto corrupto, EXIF) se aplican a los ficheros nuevos y modificados; para aplicarlas a los que ya existen, usa `hound reindex --path` (repite su OCR).
 - Las rutas se comparan sin distinguir mayúsculas, como en Windows. En Linux, dos ficheros de la misma carpeta cuyos nombres solo se diferencian en las mayúsculas se indexan como uno.
 
 ## Desarrollo

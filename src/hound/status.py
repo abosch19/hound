@@ -54,6 +54,7 @@ def index_status(conn: sqlite3.Connection, extra: dict[str, Any] | None = None) 
     counts = {r["status"]: r["n"] for r in conn.execute("SELECT status, count(*) n FROM files GROUP BY status")}
     total = sum(counts.values())
     indexed, pending, errors = counts.get("indexed", 0), counts.get("pending", 0), counts.get("error", 0)
+    partial = counts.get("partial", 0)
     hb = db.get_meta(conn, "indexer_heartbeat")
     try:
         state = json.loads(db.get_meta(conn, "indexer_state") or "{}")
@@ -62,25 +63,35 @@ def index_status(conn: sqlite3.Connection, extra: dict[str, Any] | None = None) 
     alive = bool(hb) and now - float(hb) < STALE_S
     phase = state.get("phase", "starting") if alive else "stopped"
 
-    # Ritmo de los últimos 15 minutos, para estimar cuánto falta.
+    # Ritmo de los últimos 15 minutos.
     recent, oldest = conn.execute("SELECT count(*), min(indexed_at) FROM files WHERE indexed_at > ? "
                                   "AND status != 'pending'", (now - 900,)).fetchone()
     per_hour = recent * 3600 / max(60.0, now - oldest) if recent else 0.0
-    eta_min = round(pending / per_hour * 60) if per_hour and pending else None
+    # Lo que falta, con el coste aprendido de cada tipo de fichero (no supone que todo cueste igual).
+    from .costs import backlog_seconds
+
+    left_s = backlog_seconds(conn) if pending or partial else 0.0
+    eta_min = round(left_s / 60) if left_s else None
+    pdf_done = conn.execute("SELECT coalesce(sum(pages_done), 0), coalesce(sum(pages_total), 0) FROM files "
+                            "WHERE status = 'partial'").fetchone()
 
     out: dict[str, Any] = {
         "phase": phase,
         "description": PHASES.get(phase, phase),
         "phase_since": _iso(state.get("since")) if alive else None,
-        "progress_percent": round(100 * (indexed + errors) / total, 1) if total else None,
-        "files": {"total": total, "indexed": indexed, "pending": pending, "errors": errors},
+        "progress_percent": round(100 * (indexed + errors + partial) / total, 1) if total else None,
+        "files": {"total": total, "indexed": indexed, "pending": pending, "errors": errors,
+                  "partial_pdfs": partial},
         "files_per_hour": round(per_hour),
         "eta_minutes": eta_min,
+        "eta_note": "estimación con el coste medido de cada tipo de fichero; sin contar pausas" if eta_min else None,
         "last_full_scan": _iso(db.get_meta(conn, "last_full_scan")),
         "last_heartbeat": _iso(hb),
         "by_type": {r["kind"]: r["n"] for r in conn.execute(
             "SELECT kind, count(*) n FROM files GROUP BY kind ORDER BY n DESC")},
     }
+    if partial:
+        out["partial_pdf_pages"] = {"done": pdf_done[0], "total": pdf_done[1]}
     if alive and phase == "scanning" and state.get("seen") is not None:
         out["scan_files_seen"] = state["seen"]
     if extra:
@@ -96,9 +107,25 @@ def format_status(st: dict[str, Any]) -> str:
     pct = f"{st['progress_percent']}%" if st["progress_percent"] is not None else "-"
     lines.append(f"Progreso: {pct} · {f['indexed']} indexados, {f['pending']} pendientes, {f['errors']} con error "
                  f"(de {f['total']})")
+    if f.get("partial_pdfs"):
+        p = st.get("partial_pdf_pages", {})
+        lines.append(f"  PDF largos a medias (ya se pueden buscar): {f['partial_pdfs']}, "
+                     f"{p.get('done', 0)} de {p.get('total', 0)} páginas")
     if st["files_per_hour"]:
-        eta = f", faltan ~{st['eta_minutes']} min" if st["eta_minutes"] is not None else ""
-        lines.append(f"Ritmo: {st['files_per_hour']} ficheros/hora{eta}")
+        lines.append(f"Ritmo: {st['files_per_hour']} ficheros/hora")
+    if st["eta_minutes"] is not None:
+        lines.append(f"Tiempo estimado para terminar: {_human_minutes(st['eta_minutes'])} "
+                     "(sin contar las pausas del horario laboral)")
     lines.append(f"Último escaneo completo: {st['last_full_scan'] or '-'}")
     lines.append(f"Último latido del indexador: {st['last_heartbeat'] or '-'}")
     return "\n".join(lines)
+
+
+def _human_minutes(m: int) -> str:
+    if m < 1:
+        return "<1 min"
+    if m < 90:
+        return f"~{m} min"
+    if m < 48 * 60:
+        return f"~{m / 60:.1f} h"
+    return f"~{m / 1440:.1f} días"

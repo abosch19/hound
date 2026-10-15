@@ -109,3 +109,31 @@ jobs:
           sudo hound uninstall --purge -y
           if systemctl is-active --quiet hound; then echo "El servicio sigue activo"; exit 1; fi
           test ! -e /opt/hound && test ! -e /var/lib/hound && test ! -e /usr/local/bin/hound
+
+  installer-distros:
+    # Sin systemd en el contenedor: se prueba la instalación, el OCR, el modelo y una búsqueda.
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:12", "ubuntu:22.04", "rockylinux:9"]
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    steps:
+      - name: Herramientas mínimas
+        run: |
+          if command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y -qq curl ca-certificates tar gzip git
+          else dnf install -y -q tar gzip git; fi
+      - uses: actions/checkout@v4
+      - name: Instalar con install.sh
+        run: |
+          mkdir -p /srv/compartido/Obras
+          echo "Presupuesto de la reforma de la cocina" > /srv/compartido/Obras/presupuesto.txt
+          ./install.sh --share /srv/compartido --source "$PWD" --no-service --no-firewall
+      - name: Indexar y buscar
+        run: |
+          hound index
+          hound search "reforma de la cocina" --as root | tee out.txt
+          grep -q presupuesto.txt out.txt
+          tesseract --list-langs 2>&1 | grep -qx spa
+      - name: Desinstalar
+        run: hound uninstall --purge -y && test ! -e /opt/hound

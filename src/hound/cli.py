@@ -78,6 +78,8 @@ extract_workers = 2
 busy_hours = "08:00-19:00"
 busy_days = "mon-fri"
 busy_mode = "slow"
+# Además, ir despacio cuando los demás programas usen más de este % de CPU (0 = no medir):
+max_cpu_percent = 0
 
 [ocr]
 enabled = true
@@ -551,6 +553,80 @@ def cmd_doctor(args, cfg: Config) -> int:
     return 0 if ok else 1
 
 
+def cmd_estimate(args, cfg: Config) -> int:
+    """Recorre la carpeta (sin leer el contenido) y estima cuánto tardará el primer indexado, por
+    carpeta de primer nivel: sirve para decidir qué excluir antes de empezar."""
+    import json
+
+    from .costs import CostModel
+    from .extract import kind_of
+    from .paths import Excluder
+    from .status import _human_minutes
+
+    root = cfg.share.path
+    if not root or not os.path.isdir(root):
+        print(f"La carpeta compartida no existe: {root!r}")
+        return 1
+    model = CostModel()
+    if cfg.db_path.exists():
+        model = CostModel.load(db.connect(cfg.db_path, readonly=True))
+    excluder = Excluder(cfg)
+    exts = set(cfg.index.extensions)
+    max_bytes = cfg.index.max_file_mb * 1024 * 1024
+    folders: dict[str, dict[str, list[float]]] = {}
+    stack = [(root, "")]
+    while stack:
+        d_abs, d_rel = stack.pop()
+        try:
+            entries = list(os.scandir(d_abs))
+        except OSError:
+            continue
+        for e in entries:
+            rel = f"{d_rel}/{e.name}" if d_rel else e.name
+            if excluder.name_excluded(e.name) or excluder.excluded(rel):
+                continue
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    stack.append((e.path, rel))
+                    continue
+                if not e.is_file(follow_symlinks=False):
+                    continue
+                size = e.stat().st_size
+            except OSError:
+                continue
+            ext = os.path.splitext(e.name)[1].lower()
+            if ext not in exts:
+                continue
+            top = rel.split("/")[0] if "/" in rel else "(raíz)"
+            kind = kind_of(ext) if size <= max_bytes else "other"
+            agg = folders.setdefault(top, {}).setdefault(kind, [0, 0.0])
+            agg[0] += 1
+            agg[1] += size / 1e6
+    rows = []
+    for top, kinds in folders.items():
+        secs = sum(model.estimate(k, n, mb) for k, (n, mb) in kinds.items())
+        rows.append({"folder": top, "files": int(sum(n for n, _ in kinds.values())),
+                     "mb": round(sum(mb for _, mb in kinds.values()), 1), "minutes": round(secs / 60),
+                     "by_type": {k: int(n) for k, (n, _) in sorted(kinds.items(), key=lambda x: -x[1][0])}})
+    rows.sort(key=lambda r: -r["minutes"])
+    total = {"files": sum(r["files"] for r in rows), "mb": round(sum(r["mb"] for r in rows), 1),
+             "minutes": sum(r["minutes"] for r in rows)}
+    learned = model.learned()
+    if args.json:
+        print(json.dumps({"folders": rows, "total": total, "learned_samples": learned}, ensure_ascii=False,
+                         indent=2))
+        return 0
+    print(f"{'Carpeta':<40} {'Ficheros':>9} {'MB':>10}  Tiempo estimado")
+    for r in rows:
+        print(f"{r['folder'][:40]:<40} {r['files']:>9} {r['mb']:>10.0f}  {_human_minutes(r['minutes'])}")
+    print(f"{'TOTAL':<40} {total['files']:>9} {total['mb']:>10.0f}  {_human_minutes(total['minutes'])}")
+    src = ("con el coste medido en este servidor" if any(n >= 8 for n in learned.values())
+           else "con valores por defecto (todavía no hay medidas de este servidor)")
+    print(f"\nEstimación {src}, sin contar las pausas del horario laboral. Para no indexar una carpeta, "
+          "añádela a [index] exclude.")
+    return 0
+
+
 def cmd_uninstall(args, cfg: Config) -> int:
     """Lanza el desinstalador que viene con el paquete (el mismo que uninstall.ps1 / uninstall.sh)."""
     import shutil
@@ -648,6 +724,8 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("target")
 
     sub.add_parser("status", help="Estado del índice")
+    s = sub.add_parser("estimate", help="Estima cuánto tardará el indexado, por carpeta")
+    s.add_argument("--json", action="store_true")
     s = sub.add_parser("errors", help="Ficheros que no se pudieron leer")
     s.add_argument("--limit", type=int, default=100)
     s.add_argument("--all", action="store_true", help="Incluye avisos de ficheros indexados")
@@ -687,7 +765,7 @@ def main(argv: list[str] | None = None) -> int:
     handler = {
         "model": cmd_model, "index": cmd_index, "serve": cmd_serve, "run": cmd_run, "stop": cmd_stop, "token": cmd_token,
         "status": cmd_status, "errors": cmd_errors, "reindex": cmd_reindex, "backup": cmd_backup,
-        "log": cmd_log, "search": cmd_search, "doctor": cmd_doctor, "uninstall": cmd_uninstall,
+        "log": cmd_log, "search": cmd_search, "estimate": cmd_estimate, "doctor": cmd_doctor, "uninstall": cmd_uninstall,
     }[args.cmd]
     return handler(args, cfg) or 0
 

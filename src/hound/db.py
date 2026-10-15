@@ -31,11 +31,15 @@ CREATE TABLE IF NOT EXISTS files (
     size        INTEGER NOT NULL,
     mtime       REAL NOT NULL,          -- segundos epoch
     sd_id       INTEGER REFERENCES security_descriptors(id),
-    status      TEXT NOT NULL,          -- pending | indexed | error
+    status      TEXT NOT NULL,          -- pending | partial | indexed | error
     error       TEXT,
     extractor   TEXT,                   -- versión del extractor que lo indexó
     indexed_at  REAL,
-    seq         INTEGER NOT NULL DEFAULT 0  -- último cambio, para recargas incrementales
+    seq         INTEGER NOT NULL DEFAULT 0,  -- último cambio, para recargas incrementales
+    inode       INTEGER,                -- identificador en el disco: detecta ficheros movidos
+    dev         INTEGER,
+    pages_done  INTEGER NOT NULL DEFAULT 0,  -- PDF largos: páginas ya indexadas (status = partial)
+    pages_total INTEGER
 );
 CREATE INDEX IF NOT EXISTS files_status ON files(status);
 CREATE INDEX IF NOT EXISTS files_mtime ON files(mtime);
@@ -110,9 +114,26 @@ def connect(path: Path | str, readonly: bool = False) -> sqlite3.Connection:
     return conn
 
 
+# Columnas añadidas después de la primera versión: se crean en índices existentes.
+_MIGRATIONS = {
+    "files": [("inode", "INTEGER"), ("dev", "INTEGER"), ("pages_done", "INTEGER NOT NULL DEFAULT 0"),
+              ("pages_total", "INTEGER")],
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    for table, cols in _MIGRATIONS.items():
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in cols:
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    conn.execute("CREATE INDEX IF NOT EXISTS files_inode ON files(inode)")
+
+
 def init_db(path: Path | str) -> sqlite3.Connection:
     conn = connect(path)
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
     conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('seq', '0')")
@@ -131,6 +152,7 @@ def reset_index(conn: sqlite3.Connection) -> None:
         DELETE FROM meta WHERE key IN ('model', 'last_full_scan');
     """)
     conn.executescript(SCHEMA)
+    _migrate(conn)
     set_meta(conn, "epoch", str(time.time()))
     conn.commit()
     conn.execute("VACUUM")

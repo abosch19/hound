@@ -32,6 +32,9 @@ class Extracted:
     blocks: list[Block] = field(default_factory=list)
     title: str = ""
     notes: list[str] = field(default_factory=list)
+    pages_total: int | None = None
+    pages_done: int | None = None
+    """PDF por tramos: páginas leídas hasta ahora (si es menor que pages_total, queda por leer)."""
 
 
 @dataclass
@@ -39,6 +42,10 @@ class ExtractOptions:
     ocr: OcrConfig = field(default_factory=OcrConfig)
     cad: CadConfig = field(default_factory=CadConfig)
     attachments: bool = True
+    page_start: int = 0
+    """PDF: primera página a leer (0 = desde el principio)."""
+    page_limit: int = 0
+    """PDF: cuántas páginas leer en esta pasada (0 = todas)."""
 
 
 KINDS = {
@@ -47,13 +54,15 @@ KINDS = {
     "excel": {".xlsx", ".xlsm", ".xls", ".ods", ".csv"},
     "powerpoint": {".pptx", ".pptm", ".odp", ".ppt"},
     "email": {".msg", ".eml"},
-    "text": {".txt", ".md", ".log"},
+    "text": {".txt", ".md", ".log", ".html", ".htm"},
     "image": {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp", ".gif", ".heic"},
     "cad": {".dxf", ".dwg"},
 }
 EXT_KIND = {ext: kind for kind, exts in KINDS.items() for ext in exts}
 
-# Sube el número cuando cambie un extractor para que se reprocesen esos ficheros.
+# Sube el número cuando cambie un extractor para que se reprocesen esos ficheros. Ojo: subir "pdf" o
+# "image" repite el OCR de todos ellos. Las mejoras de PDF por tramos, texto estropeado y EXIF no lo
+# suben a propósito: se aplican a lo nuevo y a lo que cambie ("hound reindex --path" para forzarlo).
 EXTRACTOR_VERSION = {
     "pdf": 1, "word": 1, "excel": 1, "powerpoint": 1, "email": 1,
     "text": 1, "image": 1, "cad": 1, "other": 1,
@@ -120,6 +129,9 @@ def extract(path: str, opts: ExtractOptions, depth: int = 0) -> Extracted:
     if ext == ".csv":
         from .text import extract_csv
         return extract_csv(path)
+    if ext in (".html", ".htm"):
+        from .text import extract_html
+        return extract_html(path)
     if kind == "text":
         from .text import extract_text
         return extract_text(path)
