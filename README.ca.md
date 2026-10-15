@@ -139,6 +139,14 @@ Torna a executar la mateixa ordre d'instal·lació (`install.ps1` o `install.sh`
 
 ### Desinstal·lar
 
+Al servidor, des d'una consola d'administrador (a Linux, amb `sudo`):
+
+```bash
+hound uninstall
+```
+
+Demana confirmació i conserva l'índex, els tokens i la configuració; afegeix `--purge` per esborrar-los també, i `-y` per no preguntar. A Windows continua en una finestra nova. També pots fer servir directament els scripts:
+
 A Windows:
 
 ```powershell

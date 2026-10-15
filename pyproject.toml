@@ -38,6 +38,11 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/hound"]
 
+# Los desinstaladores van dentro del paquete para que "hound uninstall" funcione sin descargar nada.
+[tool.hatch.build.targets.wheel.force-include]
+"uninstall.ps1" = "hound/scripts/uninstall.ps1"
+"uninstall.sh" = "hound/scripts/uninstall.sh"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

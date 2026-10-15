@@ -14,10 +14,16 @@
 param(
     [string]$InstallDir = "$env:ProgramFiles\Hound",
     [string]$DataDir = "$env:ProgramData\Hound",
-    [switch]$Purge
+    [switch]$Purge,
+    # Lo usa "hound uninstall": espera a que termine ese proceso para poder borrar su Python.
+    [string]$WaitPid = ""
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($WaitPid) {
+    foreach ($p in ($WaitPid -split ",")) { Wait-Process -Id ([int]$p) -Timeout 60 -ErrorAction SilentlyContinue }
+}
 
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -53,3 +59,4 @@ if ($Purge) {
     Write-Host "Se conservan la configuracion, el indice y los tokens en $DataDir (usa -Purge para borrarlos)."
 }
 Write-Host "Hound desinstalado." -ForegroundColor Green
+if ($WaitPid) { Read-Host "Pulsa Intro para cerrar" | Out-Null }   # ventana abierta por "hound uninstall"

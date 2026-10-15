@@ -500,6 +500,63 @@ def cmd_doctor(args, cfg: Config) -> int:
     return 0 if ok else 1
 
 
+def cmd_uninstall(args, cfg: Config) -> int:
+    """Lanza el desinstalador que viene con el paquete (el mismo que uninstall.ps1 / uninstall.sh)."""
+    import shutil
+    import subprocess
+    import tempfile
+    from importlib.resources import files
+
+    install_dir = Path(sys.prefix).parent  # el entorno de Python es <InstallDir>/venv
+    if Path(sys.prefix).name != "venv":
+        print(f"Este Hound no lo instaló el instalador (Python en {sys.prefix}): no hay nada que desinstalar.")
+        return 1
+    what = "el programa, el servicio y TODOS los datos (índice, tokens, configuración)" if args.purge else \
+        "el programa y el servicio (se conservan índice, tokens y configuración)"
+    if not args.yes:
+        try:
+            answer = input(f"Se eliminará {what} de {install_dir}. ¿Continuar? [s/N] ")
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() not in ("s", "si", "sí", "y"):
+            print("Cancelado.")
+            return 1
+    name = "uninstall.ps1" if sys.platform == "win32" else "uninstall.sh"
+    # Se copia fuera: el desinstalador borra la carpeta del programa, donde está ahora.
+    tmp = Path(tempfile.mkdtemp(prefix="hound-uninstall-")) / name
+    shutil.copyfile(str(files("hound") / "scripts" / name), tmp)
+    if sys.platform == "win32":
+        import psutil
+
+        # Este proceso y sus padres que usan ficheros del programa (el lanzador del venv).
+        pids = [os.getpid()]
+        for parent in psutil.Process().parents():
+            try:
+                if Path(parent.exe()).is_relative_to(install_dir):
+                    pids.append(parent.pid)
+            except (psutil.Error, ValueError):
+                pass
+        cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(tmp),
+               "-InstallDir", str(install_dir), "-DataDir", str(cfg.data_path), "-WaitPid", ",".join(map(str, pids))]
+        if args.purge:
+            cmd.append("-Purge")
+        # En Windows no se puede borrar el Python que está en marcha: el desinstalador espera a
+        # que este proceso termine y sigue en su propia ventana.
+        subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)  # type: ignore[attr-defined]
+        print("Desinstalación en marcha en una ventana nueva.")
+        return 0
+    if os.geteuid() != 0:
+        print("Ejecútalo como root: sudo hound uninstall")
+        return 1
+    config_dir = Path(cfg.config_path).parent if cfg.config_path else Path("/etc/hound")
+    cmd = ["bash", str(tmp), "--install-dir", str(install_dir), "--data-dir", str(cfg.data_path),
+           "--config-dir", str(config_dir)]
+    if args.purge:
+        cmd.append("--purge")
+    os.execvp("bash", cmd)  # en Linux sí se pueden borrar los ficheros de un programa en marcha
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="hound", description="Buscador semántico de la carpeta compartida (MCP)")
     p.add_argument("--config", help="Ruta de config.toml (por defecto la de HOUND_CONFIG)")
@@ -564,6 +621,10 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("doctor", help="Comprueba la instalación")
 
+    s = sub.add_parser("uninstall", help="Desinstala Hound (servicio, programa y, con --purge, los datos)")
+    s.add_argument("--purge", action="store_true", help="Borra también el índice, los tokens y la configuración")
+    s.add_argument("-y", "--yes", action="store_true", help="No pedir confirmación")
+
     args = p.parse_args(argv)
     if args.cmd == "init":
         return cmd_init(args)
@@ -573,7 +634,7 @@ def main(argv: list[str] | None = None) -> int:
     handler = {
         "model": cmd_model, "index": cmd_index, "serve": cmd_serve, "run": cmd_run, "token": cmd_token,
         "status": cmd_status, "errors": cmd_errors, "reindex": cmd_reindex, "backup": cmd_backup,
-        "log": cmd_log, "search": cmd_search, "doctor": cmd_doctor,
+        "log": cmd_log, "search": cmd_search, "doctor": cmd_doctor, "uninstall": cmd_uninstall,
     }[args.cmd]
     return handler(args, cfg) or 0
 

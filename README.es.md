@@ -139,6 +139,14 @@ Vuelve a ejecutar el mismo comando de instalación (`install.ps1` o `install.sh`
 
 ### Desinstalar
 
+En el servidor, desde una consola de administrador (en Linux, con `sudo`):
+
+```bash
+hound uninstall
+```
+
+Pide confirmación y conserva el índice, los tokens y la configuración; añade `--purge` para borrarlos también, y `-y` para no preguntar. En Windows sigue en una ventana nueva. También puedes usar directamente los scripts:
+
 En Windows:
 
 ```powershell

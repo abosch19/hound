@@ -139,6 +139,14 @@ Run the same installation command again (`install.ps1` or `install.sh`). Configu
 
 ### Uninstalling
 
+On the server, from an administrator console (on Linux, with `sudo`):
+
+```bash
+hound uninstall
+```
+
+It asks for confirmation and keeps the index, tokens and configuration; add `--purge` to delete them too, and `-y` to skip the question. On Windows it continues in a new window. You can also use the scripts directly:
+
 On Windows:
 
 ```powershell

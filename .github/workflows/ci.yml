@@ -102,6 +102,6 @@ jobs:
         run: sudo journalctl -u hound --no-pager -n 200
       - name: Desinstalar
         run: |
-          sudo ./uninstall.sh --purge
+          sudo hound uninstall --purge -y
           if systemctl is-active --quiet hound; then echo "El servicio sigue activo"; exit 1; fi
           test ! -e /opt/hound && test ! -e /var/lib/hound && test ! -e /usr/local/bin/hound
