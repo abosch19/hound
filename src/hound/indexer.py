@@ -38,6 +38,18 @@ log = logging.getLogger("hound.indexer")
 EMBED_BATCH_CHUNKS = 64
 PDF_FIRST_PAGES = 30   # primera pasada de un PDF largo: ya se puede buscar
 PDF_STEP_PAGES = 50    # pasadas siguientes, cuando no queda nada pendiente
+
+
+def _i64(n: int) -> int | None:
+    """Inodo o dispositivo como entero con signo de 64 bits, lo que cabe en SQLite.
+
+    En Windows los identificadores de fichero de NTFS/ReFS son sin signo y pueden ocupar 64 o 128 bits.
+    """
+    if not n:
+        return None
+    while n >> 64:
+        n = (n & (2**64 - 1)) ^ (n >> 64)
+    return n - 2**64 if n >= 2**63 else n
 VISUAL_LOCATION = "imagen (lo que se ve)"
 
 
@@ -281,7 +293,7 @@ class Indexer:
         # renombrado: se cambia la ruta y se conserva lo indexado (sin repetir extracción ni OCR).
         by_inode = {(r["dev"], r["inode"], r["size"]): (k, r) for k, r in gone.items() if r["inode"]}
         for abs_path, rel, ext, st in new_files:
-            hit = by_inode.get((st.st_dev, st.st_ino, st.st_size)) if st.st_ino else None
+            hit = by_inode.get((_i64(st.st_dev), _i64(st.st_ino), st.st_size)) if st.st_ino else None
             if hit and abs(hit[1]["mtime"] - st.st_mtime) < 1e-3:
                 key, row = hit
                 del gone[key], by_inode[(row["dev"], row["inode"], row["size"])]
@@ -316,12 +328,12 @@ class Indexer:
                 "INSERT INTO files(path, name, ext, kind, size, mtime, sd_id, status, seq, inode, dev) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
                 (rel, rel.rpartition("/")[2], ext, kind, st.st_size, st.st_mtime, sd_id, db.next_seq(self.conn),
-                 st.st_ino or None, st.st_dev))
+                 _i64(st.st_ino), _i64(st.st_dev)))
             stats.new += 1
             return
-        if row["inode"] != (st.st_ino or None):  # índices anteriores a esta columna, o fichero sustituido
+        if row["inode"] != _i64(st.st_ino):  # índices anteriores a esta columna, o fichero sustituido
             self.conn.execute("UPDATE files SET inode = ?, dev = ? WHERE id = ?",
-                              (st.st_ino or None, st.st_dev, row["id"]))
+                              (_i64(st.st_ino), _i64(st.st_dev), row["id"]))
         changed = row["size"] != st.st_size or abs(row["mtime"] - st.st_mtime) > 1e-3 or \
             (row["status"] != "pending" and row["extractor"] != extractor_tag(kind, self.caps))
         if changed:

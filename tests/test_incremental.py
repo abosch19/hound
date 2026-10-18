@@ -64,6 +64,15 @@ def test_carpeta_renombrada_no_se_reindexa(env):
     assert res[0]["path"].endswith("Proyectos\\Cocina\\presupuesto.txt")
 
 
+def test_inodos_de_windows_caben_en_sqlite():
+    from hound.indexer import _i64
+    big = [2**63, 2**64 - 1, 0x0011_0000_0000_C0FF_EE00_0000_0000_1234]  # NTFS sin signo, ReFS de 128 bits
+    for n in big:
+        assert -2**63 <= _i64(n) < 2**63
+    assert len({_i64(n) for n in big}) == len(big)
+    assert _i64(0) is None and _i64(42) == 42
+
+
 def test_fichero_cambiado_y_movido_si_se_reindexa(env):
     _cfg, root, ix, _emb = env
     _run(ix)
