@@ -74,6 +74,9 @@ jobs:
             throw "El servicio no se ha parado"
           }
           if ($sw.Elapsed.TotalSeconds -gt 15) { throw "El servicio tarda demasiado en pararse" }
+          Start-Sleep -Seconds 2
+          $left = Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like "$env:ProgramFiles\Hound\*" }
+          if ($left) { $left | Format-Table ProcessId, CommandLine -AutoSize -Wrap; throw "Quedan procesos de Hound tras parar el servicio" }
           .\uninstall.ps1 -Purge
 
   installer-linux:

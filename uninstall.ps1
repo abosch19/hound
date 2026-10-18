@@ -38,6 +38,10 @@ if (Get-Service -Name "Hound" -ErrorAction SilentlyContinue) {
     if (Test-Path $svcExe) { & $svcExe uninstall | Out-Null } else { & sc.exe delete Hound | Out-Null }
 }
 
+# Procesos que sigan usando el Python del programa (no se podría borrar).
+Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith("$InstallDir\", "OrdinalIgnoreCase") } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
 Get-NetFirewallRule -DisplayName "Hound MCP" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 
 $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")

@@ -284,6 +284,8 @@ def _indexer_process(config_path: str, verbose: bool, parent_pid: int) -> None:
 
 def cmd_run(args, cfg: Config) -> int:
     """Modo servicio: indexador en un proceso aparte (se reinicia si falla) + servidor MCP."""
+    import psutil
+
     setup_logging(cfg, "server", args.verbose)
     db.init_db(cfg.db_path).close()
     stop = threading.Event()
@@ -303,8 +305,18 @@ def cmd_run(args, cfg: Config) -> int:
                 p.join(1)
             sup["running"] = False
             if stop.is_set():
+                # También sus procesos de extracción: en Windows quedarían huérfanos con el Python bloqueado.
+                try:
+                    workers = psutil.Process(p.pid).children(recursive=True)
+                except psutil.Error:
+                    workers = []
                 p.terminate()
                 p.join(10)
+                for w in workers:
+                    try:
+                        w.kill()
+                    except psutil.Error:
+                        pass
                 return
             delay = 5 if time.monotonic() - started > 600 else min(delay * 2, 600)
             log.error("El indexador terminó (código %s). Reinicio en %d s", p.exitcode, delay)
