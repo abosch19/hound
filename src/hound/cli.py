@@ -773,7 +773,10 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--purge", action="store_true", help="Borra también el índice, los tokens y la configuración")
     s.add_argument("-y", "--yes", action="store_true", help="No pedir confirmación")
 
-    args = p.parse_args(argv)
+    args, extra = p.parse_known_args(argv)
+    # WinSW 2 añade a <stoparguments> los argumentos de arranque ("-m hound ... run"): se ignoran.
+    if extra and args.cmd != "stop":
+        p.error("argumentos no reconocidos: " + " ".join(extra))
     if args.cmd == "init":
         return cmd_init(args)
     cfg = load_config(args.config)
