@@ -29,6 +29,7 @@ jobs:
 
   installer:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Instalar con install.ps1 (desde el código del commit)
@@ -63,9 +64,16 @@ jobs:
       - name: Desinstalar
         shell: powershell
         run: |
-          $t = Measure-Command { Stop-Service Hound }
-          "Parada del servicio: $([int]$t.TotalSeconds) s"
-          if ($t.TotalSeconds -gt 15) { throw "El servicio tarda demasiado en pararse" }
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          sc.exe stop Hound | Out-Null
+          while ((Get-Service Hound).Status -ne "Stopped" -and $sw.Elapsed.TotalSeconds -lt 60) { Start-Sleep -Milliseconds 250 }
+          "Parada del servicio: $([int]$sw.Elapsed.TotalSeconds) s"
+          if ((Get-Service Hound).Status -ne "Stopped") {
+            Get-CimInstance Win32_Process | Where-Object { $_.Name -match "python|WinSW|HoundService" } | Format-Table ProcessId, ParentProcessId, CommandLine -AutoSize -Wrap
+            Get-ChildItem "$env:ProgramData\Hound\logs" | ForEach-Object { "== $_"; Get-Content $_.FullName -Tail 30 }
+            throw "El servicio no se ha parado"
+          }
+          if ($sw.Elapsed.TotalSeconds -gt 15) { throw "El servicio tarda demasiado en pararse" }
           .\uninstall.ps1 -Purge
 
   installer-linux:
